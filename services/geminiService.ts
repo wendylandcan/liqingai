@@ -1,6 +1,7 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from "openai";
-import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, DisputePoint, EvidenceType } from "../types";
+import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, EvidenceType } from "../types";
 
 // --- Environment Configuration ---
 
@@ -354,57 +355,6 @@ export const extractFactPoints = async (narrative: string): Promise<FactCheckRes
 };
 
 /**
- * Identifies core dispute points.
- * Logic: Switch to Gemini 1.5 Flash (Simple Task)
- */
-export const analyzeDisputeFocus = async (
-  category: string,
-  plaintiffDesc: string,
-  defenseDesc: string,
-  plaintiffRebuttal: string,
-  defendantRebuttal: string,
-): Promise<DisputePoint[]> => {
-  try {
-    const result = await smartGenerate({
-      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash
-      jsonMode: true,
-      systemInstruction: `You are an AI Judge's Assistant specializing in conflict resolution.
-        
-        TASK: Analyze the "He said, She said" history and identify 1-3 CORE DISPUTE POINTS.
-        
-        REQUIREMENTS:
-        1. **Strict Terminology**: ALWAYS refer to the parties as "原告" (Plaintiff) and "被告" (Defendant). NEVER use "男方" (Male side), "女方" (Female side), "老公", "老婆", "男朋友", or "女朋友".
-        2. **Simple & Plain Language**: Use very simple, colloquial, easy-to-understand Chinese (通俗易懂). Avoid complex legal jargon.
-        3. **Concise**: Keep descriptions short and straight to the point (简明扼要).
-        4. **Focus**: Identify the underlying disagreement (e.g., "关于钱怎么花的矛盾" instead of "Financial Allocation Dispute").
-        
-        OUTPUT: JSON format with key "points" containing an array of objects (title, description).`,
-      prompt: `Category: ${category}
-      Plaintiff: ${plaintiffDesc}
-      Defendant: ${defenseDesc}
-      Plaintiff Rebuttal: ${plaintiffRebuttal}
-      Defendant Rebuttal: ${defendantRebuttal}`
-    });
-
-    const parsed = JSON.parse(result);
-    const points = parsed.points || [];
-    
-    return points.map((p: any, index: number) => ({
-        ...p,
-        id: p.id ? String(p.id) : `focus-${index}-${Date.now()}`
-    })) as DisputePoint[];
-
-  } catch (error) {
-    console.error("Dispute Analysis Error", error);
-    return [{
-      id: "default-1",
-      title: "核心矛盾",
-      description: "关于双方对于事件认知和责任认定的根本分歧。"
-    }];
-  }
-};
-
-/**
  * Generates the final verdict.
  * Logic: DeepSeek -> Gemini Flash Fallback (Complex Task / Pro)
  * SKILL: Persona-Based Adjudication & Intimate Relationship Expert
@@ -420,7 +370,6 @@ export const generateVerdict = async (
   plaintiffRebuttalEvidence: EvidenceItem[],
   defendantRebuttal: string,
   defendantRebuttalEvidence: EvidenceItem[],
-  disputePoints: DisputePoint[],
   persona: JudgePersona
 ): Promise<Verdict> => {
   
@@ -438,8 +387,8 @@ export const generateVerdict = async (
   }
 
   // Check for Default Judgment Scenario
-  // If disputePoints is empty or defenseDesc indicates absence
-  const isDefaultJudgment = defenseDesc.includes("被告缺席") || disputePoints.length === 0;
+  // If defenseDesc indicates absence
+  const isDefaultJudgment = defenseDesc.includes("被告缺席");
 
   if (isDefaultJudgment) {
     systemInstruction += `
@@ -448,7 +397,6 @@ export const generateVerdict = async (
     1. The defendant has waived their right to defend.
     2. You must evaluate the case based PRIMARILY on whether the Plaintiff's claims are logical and supported by their evidence.
     3. You do not need to find a "middle ground". If the plaintiff makes sense, rule in their favor (e.g., 100/0 or 90/10).
-    4. "disputeAnalyses" should focus on the validity of the Plaintiff's key demands since there is no counter-argument.
     `;
   }
 
@@ -462,7 +410,7 @@ export const generateVerdict = async (
   CORE RESPONSIBILITIES (Relationship Expert Mode):
   1. **Final Judgment (finalJudgment)**: 
      - You MUST explicitly address the Plaintiff's DEMANDS ("${plaintiffDemands}").
-     - Combine the "Dispute Points" analysis to explain WHY you are granting, denying, or modifying these demands.
+     - Analyze the evidence and rebuttals to explain WHY you are granting, denying, or modifying these demands.
      - Provide closure.
 
   2. **Compensation/Penalty Tasks (penaltyTasks)**:
@@ -472,9 +420,6 @@ export const generateVerdict = async (
        a) **Restorative**: Heals the emotional bond.
        b) **Preventive**: Creates a mechanism to avoid this specific conflict in the future (e.g., "Draft a budget protocol", "Set a 'safe word' for arguments").
        c) **Human-Centric**: "Cook a meal", "Write a letter", "3-minute hug".
-
-  3. **Dispute Analysis (disputeAnalyses)**:
-     - For each core dispute point, provide a final ruling/insight based on the debate arguments.
   
   OUTPUT REQUIREMENT:
   You must output valid JSON.
@@ -482,7 +427,6 @@ export const generateVerdict = async (
   - summary (string)
   - facts (array of strings)
   - responsibilitySplit (object {plaintiff: number, defendant: number} - must sum to 100)
-  - disputeAnalyses (array of objects {title: string, analysis: string})
   - reasoning (string)
   - finalJudgment (string - Address the demands!)
   - penaltyTasks (array of strings - Creative & Preventive)
@@ -517,16 +461,6 @@ export const generateVerdict = async (
   const formatEvidence = (items: EvidenceItem[]) => 
     items.map(e => `[${e.type === 'TEXT' ? '文字' : '图片'}] ${e.description || '无描述'} (Contested: ${e.isContested ? 'Yes' : 'No'})`).join('\n') || "None";
 
-  const formatDebate = (points: DisputePoint[]) => {
-      if (!points || points.length === 0) return "None (Default Judgment / No Debate)";
-      return points.map(p => `
-        [Dispute Point]: ${p.title}
-        [Description]: ${p.description}
-        [Plaintiff's Final Argument]: ${p.plaintiffArg || "Waived"}
-        [Defendant's Final Argument]: ${p.defendantArg || "Waived"}
-      `).join('\n');
-  };
-
   const caseDetails = `
     CASE FILE:
     Category: ${category}
@@ -542,9 +476,6 @@ export const generateVerdict = async (
     Defendant Evidence: ${formatEvidence(defendantEvidence)}
     Plaintiff Rebuttal: "${plaintiffRebuttal}"
     Defendant Rebuttal: "${defendantRebuttal}"
-
-    --- PHASE 3: FINAL DEBATE ON CORE DISPUTES ---
-    ${formatDebate(disputePoints)}
   `;
 
   try {
@@ -566,8 +497,7 @@ export const generateVerdict = async (
         reasoning: "连接 AI 服务时出错，请检查 API Key 或网络（可能由于服务过载）。",
         finalJudgment: "抱歉，本法官暂时掉线了，请稍后再试。",
         penaltyTasks: [],
-        tone: "系统错误",
-        disputeAnalyses: []
+        tone: "系统错误"
     };
   }
 };

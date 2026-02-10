@@ -1,9 +1,10 @@
+
 import React, { useState } from 'react';
 import { 
   Scale, 
   User, 
   Loader2, 
-  Swords, 
+  Gavel, 
   AlertOctagon, 
   BookOpen,
   Info
@@ -13,7 +14,6 @@ import {
   CaseStatus, 
   UserRole 
 } from './types';
-import * as GeminiService from './services/geminiService';
 import { VoiceTextarea, EvidenceList, ThreeQualitiesInfo } from './components/Shared';
 
 interface VerdictSectionProps {
@@ -26,7 +26,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   // Local state for edits
   const [plRebuttal, setPlRebuttal] = useState(data.plaintiffRebuttal);
   const [defRebuttal, setDefRebuttal] = useState(data.defendantRebuttal || "");
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
   // Handlers for "Save Draft / Update State"
   const handleUpdate = (patch: Partial<CaseData>) => {
@@ -35,7 +35,6 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
 
   const isPlaintiff = role === UserRole.PLAINTIFF;
   const isDefendant = role === UserRole.DEFENDANT;
-  const isSpectator = role === UserRole.SPECTATOR;
 
   // Toggle contest logic
   const togglePlaintiffEvidenceContest = (id: string) => {
@@ -49,26 +48,12 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   };
 
   const handleFinishCrossExam = async () => {
-    setIsAnalyzing(true);
-    // Analyze and generate dispute points
-    try {
-        const points = await GeminiService.analyzeDisputeFocus(
-            data.category,
-            data.description,
-            data.defenseStatement,
-            data.plaintiffRebuttal,
-            data.defendantRebuttal || ""
-        );
-        // Move to DEBATE phase
-        onSubmit({ 
-            status: CaseStatus.DEBATE,
-            disputePoints: points
-        });
-    } catch (e) {
-        alert("AI 分析争议焦点失败，请重试");
-    } finally {
-        setIsAnalyzing(false);
-    }
+    setIsSubmitting(true);
+    // Proceed directly to Adjudication, skipping Debate phase
+    onSubmit({ 
+        status: CaseStatus.ADJUDICATING,
+    });
+    setIsSubmitting(false);
   };
 
   // --- Render Helpers for Strict Isolation ---
@@ -198,15 +183,15 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
       {/* 4. Next Step Warning */}
       <div className="bg-yellow-50 border border-yellow-200 p-4 rounded-xl text-sm text-yellow-800 flex gap-2 items-start shadow-sm">
          <AlertOctagon className="shrink-0 mt-0.5" size={18}/>
-         <p>下一步将由 AI 总结核心争议焦点，双方可针对焦点进行最后一轮辩论。</p>
+         <p>质证结束后，将提交给 AI 法官进行最终裁决。</p>
       </div>
 
       {/* 5. Submit Button */}
-      <button onClick={handleFinishCrossExam} disabled={isAnalyzing} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl hover:bg-black shadow-lg flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform">
-        {isAnalyzing ? (
-            <><Loader2 className="animate-spin" size={20}/> AI 正在分析争议焦点...</>
+      <button onClick={handleFinishCrossExam} disabled={isSubmitting} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl hover:bg-black shadow-lg flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform">
+        {isSubmitting ? (
+            <><Loader2 className="animate-spin" size={20}/> 正在提交审理...</>
         ) : (
-            <><Swords size={20}/> 结束质证，进入争议焦点辩论</>
+            <><Gavel size={20}/> 结束质证，提交判决</>
         )}
       </button>
     </div>
