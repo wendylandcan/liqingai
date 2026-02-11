@@ -521,7 +521,13 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
                  补偿任务
              </h3>
              <ul className="list-disc list-inside text-slate-600 space-y-1 font-sans">
-               {verdict.penaltyTasks.map((t, i) => <li key={i}>{t}</li>)}
+               {verdict.penaltyTasks.map((t: any, i) => {
+                 // Check if it's an object to prevent React Error #31
+                 const text = typeof t === 'object' && t !== null 
+                    ? (t.taskName && t.description ? `${t.taskName}: ${t.description}` : JSON.stringify(t)) 
+                    : String(t);
+                 return <li key={i}>{text}</li>;
+               })}
              </ul>
          </div>
       )}
@@ -572,8 +578,8 @@ const Dashboard = ({ user, onSelectCase, onLogout }: { user: string, onSelectCas
     }
   };
 
-  const handleJoin = () => {
-    const res = MockDb.joinCase(joinCode.trim().toUpperCase(), user);
+  const handleJoin = async () => {
+    const res = await MockDb.joinCase(joinCode.trim().toUpperCase(), user);
     if (res.success && res.caseId) onSelectCase(res.caseId);
     else alert(res.error || "加入失败");
   };
@@ -772,13 +778,7 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
 
     // Phase: ADJUDICATING -> Go back to previous step
     if (data.status === CaseStatus.ADJUDICATING) {
-        // 1. If appealing (verdict exists), go back to Verdict View
-        if (data.verdict) {
-            update({ status: CaseStatus.CLOSED });
-            return;
-        }
-        
-        // 2. If Default Judgment (detected by specific text), go back to Defense Pending and reset
+        // 1. If Default Judgment (detected by specific text), go back to Defense Pending and reset
         if (data.defenseStatement === "（被告缺席，放弃答辩）") {
              update({ 
                  status: CaseStatus.DEFENSE_PENDING,
@@ -788,7 +788,7 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
              return;
         }
 
-        // 3. Otherwise, go back to Debate
+        // 2. Otherwise, go back to Debate
         update({ status: CaseStatus.DEBATE });
         return;
     }
@@ -881,7 +881,26 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
       break;
     case CaseStatus.CLOSED:
       title = "最终判决";
-      content = <VerdictView verdict={data.verdict!} persona={data.judgePersona} onReset={() => onBack()} onAppeal={() => update({ status: CaseStatus.ADJUDICATING })} />;
+      content = <VerdictView 
+        verdict={data.verdict!} 
+        persona={data.judgePersona} 
+        onReset={() => onBack()} 
+        onAppeal={() => {
+            // Logic to determine where to go back to "Unclose" the case for supplementation
+            const isDefaultJudgment = data.defenseStatement === "（被告缺席，放弃答辩）";
+            if (isDefaultJudgment) {
+                 // Reset default judgment state so users can edit or wait for defendant
+                 update({ 
+                     status: CaseStatus.DEFENSE_PENDING,
+                     defenseStatement: "", 
+                     defenseSummary: undefined 
+                 });
+            } else {
+                 // Normal flow: Go back to Debate to allow adding more arguments
+                 update({ status: CaseStatus.DEBATE });
+            }
+        }} 
+      />;
       break;
     case CaseStatus.CANCELLED:
       title = "已撤诉";
@@ -937,59 +956,65 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
 };
 
 const App = () => {
+  const [session, setSession] = useState<any>(null);
   const [user, setUser] = useState<string | null>(null);
   const [activeCaseId, setActiveCaseId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // 1. Check initial session
+    // Get initial session
     supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
       if (session?.user) {
-        // Prefer username from metadata, fallback to email part, fallback to email
-        const name = session.user.user_metadata?.username || session.user.email?.split('@')[0] || 'User';
-        setUser(name);
+        // Use metadata username or fallback to email
+        const u = session.user.user_metadata?.username || session.user.email;
+        setUser(u);
       }
       setLoading(false);
     });
 
-    // 2. Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    // Listen for changes
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
       if (session?.user) {
-        const name = session.user.user_metadata?.username || session.user.email?.split('@')[0] || 'User';
-        setUser(name);
+        const u = session.user.user_metadata?.username || session.user.email;
+        setUser(u);
       } else {
         setUser(null);
-        setActiveCaseId(null);
       }
-      setLoading(false);
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-    // User state will be cleared by the onAuthStateChange listener
-  };
-
   if (loading) {
-     return <div className="min-h-screen flex items-center justify-center"><Loader2 className="animate-spin text-rose-600" /></div>;
+    return <div className="min-h-screen flex items-center justify-center bg-rose-50"><Loader2 className="animate-spin text-rose-600" size={32}/></div>;
   }
 
-  if (!user) return <Auth />;
-  
+  if (!session || !user) {
+    return <Auth />;
+  }
+
   if (activeCaseId) {
     return (
       <CaseManager 
         caseId={activeCaseId} 
         user={user} 
-        onBack={() => setActiveCaseId(null)} 
-        onSwitchUser={handleLogout} 
+        onBack={() => setActiveCaseId(null)}
+        onSwitchUser={() => supabase.auth.signOut()}
       />
     );
   }
 
-  return <Dashboard user={user} onSelectCase={setActiveCaseId} onLogout={handleLogout} />;
+  return (
+    <Dashboard 
+      user={user} 
+      onSelectCase={setActiveCaseId} 
+      onLogout={() => supabase.auth.signOut()} 
+    />
+  );
 };
 
 export default App;

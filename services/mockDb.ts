@@ -87,18 +87,84 @@ export const MockDb = {
   },
 
   // Join a case via code
-  joinCase: (code: string, defendantId: string): { success: boolean, caseId?: string, error?: string } => {
+  joinCase: async (code: string, defendantId: string): Promise<{ success: boolean, caseId?: string, error?: string }> => {
     const db = getDb();
-    const caseItem = Object.values(db).find(c => c.shareCode === code);
-    
-    if (!caseItem) return { success: false, error: "无效的案件代码" };
-    if (caseItem.plaintiffId === defendantId) return { success: false, error: "您是原告，无法作为被告加入" };
-    if (caseItem.defendantId && caseItem.defendantId !== defendantId) return { success: false, error: "该案件已有被告" };
+    const cleanCode = code.trim().toUpperCase();
 
-    caseItem.defendantId = defendantId;
-    caseItem.lastUpdateDate = Date.now();
-    saveDb(db);
-    return { success: true, caseId: caseItem.id };
+    try {
+      // 1. Query Cloud (Supabase) first
+      const { data: remoteCase, error } = await supabase
+        .from('cases')
+        .select('*')
+        .eq('share_code', cleanCode)
+        .single();
+
+      if (error || !remoteCase) {
+        return { success: false, error: "无效的案件代码" };
+      }
+
+      // 2. Validate Identity
+      if (remoteCase.plaintiff_id === defendantId) {
+        return { success: false, error: "您是原告，无法作为被告加入" };
+      }
+
+      if (remoteCase.defendant_id && remoteCase.defendant_id !== defendantId) {
+        return { success: false, error: "该案件已有被告" };
+      }
+
+      // 3. Update Cloud (if not already set)
+      if (!remoteCase.defendant_id) {
+        const { error: updateError } = await supabase
+          .from('cases')
+          .update({ defendant_id: defendantId })
+          .eq('id', remoteCase.id);
+        
+        if (updateError) {
+          console.error("Join update failed:", updateError);
+          return { success: false, error: "加入失败: 云端同步错误" };
+        }
+        // Optimistically update local reference
+        remoteCase.defendant_id = defendantId;
+      }
+
+      // 4. Sync to Local Cache (Map snake_case DB to camelCase App)
+      // This ensures the user has the case data locally immediately
+      const localCase: CaseData = {
+        id: remoteCase.id,
+        shareCode: remoteCase.share_code,
+        createdDate: new Date(remoteCase.created_at).getTime(),
+        lastUpdateDate: Date.now(),
+        plaintiffId: remoteCase.plaintiff_id,
+        defendantId: remoteCase.defendant_id,
+        category: remoteCase.category,
+        description: remoteCase.description || '',
+        title: remoteCase.title,
+        plaintiffSummary: remoteCase.plaintiff_summary,
+        demands: remoteCase.demands || '',
+        evidence: remoteCase.evidence || [],
+        defenseStatement: remoteCase.defense_statement || '',
+        defenseSummary: remoteCase.defense_summary,
+        defendantEvidence: remoteCase.defendant_evidence || [],
+        plaintiffRebuttal: remoteCase.plaintiff_rebuttal || '',
+        // Handle potentially missing columns gracefully with defaults
+        plaintiffRebuttalEvidence: remoteCase.plaintiff_rebuttal_evidence || [], 
+        defendantRebuttal: remoteCase.defendant_rebuttal || '',
+        defendantRebuttalEvidence: remoteCase.defendant_rebuttal_evidence || [],
+        disputePoints: remoteCase.dispute_points || [],
+        judgePersona: remoteCase.judge_persona || JudgePersona.BORDER_COLLIE,
+        status: remoteCase.status as CaseStatus,
+        verdict: remoteCase.verdict
+      };
+
+      db[localCase.id] = localCase;
+      saveDb(db);
+
+      return { success: true, caseId: localCase.id };
+
+    } catch (e) {
+      console.error("Join error:", e);
+      return { success: false, error: "网络连接失败，请稍后重试" };
+    }
   },
 
   // Update a case

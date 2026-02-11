@@ -595,7 +595,22 @@ export const generateVerdict = async (
       images: allImages // Pass the extracted images
     });
 
-    return JSON.parse(result) as Verdict;
+    const parsed = JSON.parse(result);
+    
+    // Sanitize penaltyTasks to ensure strings
+    if (parsed.penaltyTasks && Array.isArray(parsed.penaltyTasks)) {
+      parsed.penaltyTasks = parsed.penaltyTasks.map((t: any) => {
+        if (typeof t === 'string') return t;
+        // Flatten object if AI hallucinations created a structured object
+        if (typeof t === 'object' && t !== null) {
+             if (t.taskName && t.description) return `${t.taskName}: ${t.description}`;
+             return Object.values(t).join(': ');
+        }
+        return String(t);
+      });
+    }
+
+    return parsed as Verdict;
   } catch (error) {
     console.error("Verdict Generation Error", error);
     return {
