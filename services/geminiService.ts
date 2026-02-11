@@ -33,10 +33,9 @@ const GEMINI_API_KEY = getEnvVar('API_KEY', 'VITE_GEMINI_API_KEY');
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY || process.env.API_KEY });
 
 // --- Model Constants ---
-// Use Flash for simple tasks (speed)
-const GEMINI_MODEL_FLASH = 'gemini-3-flash-preview'; 
-// Use Pro for complex analysis (replacing DeepSeek/Gemini 1.5 Pro requirement with latest Pro model)
-const GEMINI_MODEL_PRO = 'gemini-3-pro-preview'; 
+// Unified model: gemini-2.0-flash (Smart, Fast, Cost-effective)
+const GEMINI_MODEL_FLASH = 'gemini-2.0-flash'; 
+const GEMINI_MODEL_PRO = 'gemini-2.0-flash'; 
 
 // --- Helper: Retry Logic ---
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +77,7 @@ async function callGemini(params: {
     return await retryWithBackoff(async () => {
       const config: any = {
         systemInstruction: params.systemInstruction,
-        temperature: params.temperature ?? 0.7, // Default to 0.7 as requested for flexibility
+        temperature: params.temperature ?? 0.7, // Default to 0.7 as requested
       };
 
       if (params.jsonMode) {
@@ -214,7 +213,7 @@ export const extractFactPoints = async (narrative: string): Promise<FactCheckRes
 
 /**
  * Identifies core dispute points.
- * NOW EXCLUSIVELY USES GEMINI PRO (High Quality).
+ * Uses GEMINI 2.0 Flash with "Experienced Judge" Persona.
  */
 export const analyzeDisputeFocus = async (
   category: string,
@@ -222,7 +221,7 @@ export const analyzeDisputeFocus = async (
   defenseDesc: string,
   plaintiffRebuttal: string,
   defendantRebuttal: string,
-  plaintiffEvidence: EvidenceItem[] // Added Plaintiff Evidence
+  plaintiffEvidence: EvidenceItem[] 
 ): Promise<DisputePoint[]> => {
   
   // Format evidence for prompt
@@ -230,26 +229,29 @@ export const analyzeDisputeFocus = async (
     ? plaintiffEvidence.map((e, i) => `${i+1}. [${e.type}] ${e.description || '无描述'}`).join('\n') 
     : "（未提交主要证据）";
 
+  // New System Instruction as requested
+  const JUDGE_SYSTEM_PROMPT = `你是一个经验丰富的 AI 法官，擅长挖掘情感纠纷背后的深层逻辑。你的分析必须客观、分点陈述，并引用原告和被告的具体证词。
+  
+  你的具体任务：
+  1. 提炼 1-3 个最核心的争议焦点。
+  2. 每个焦点的描述必须是一个具体的【是/否问句】（Yes/No Question），供双方辩论。
+  
+  输出 JSON 格式：
+  {
+    "points": [
+       {
+         "title": "简短标题",
+         "description": "具体的 是/否 辩论问句"
+       }
+    ]
+  }`;
+
   try {
     const result = await callGemini({
-      model: GEMINI_MODEL_PRO, // Mandatory High Quality Model
+      model: GEMINI_MODEL_PRO, // Now mapped to gemini-2.0-flash
       jsonMode: true,
-      temperature: 0.7, // As requested for flexibility
-      systemInstruction: `你是一位公正、深刻的 AI 法官。请根据原告和被告的陈述，分析案件的核心争议焦点。你的分析必须深入具体，拒绝笼统的套话，并明确引用双方的陈述作为依据。
-      
-      你的输出任务：
-      1. 提炼 1-3 个最核心的争议焦点。
-      2. 每个焦点的描述必须是一个具体的【是/否问句】（Yes/No Question），供双方辩论。
-      
-      输出 JSON 格式：
-      {
-        "points": [
-           {
-             "title": "简短标题",
-             "description": "具体的 是/否 辩论问句"
-           }
-        ]
-      }`,
+      temperature: 0.7, 
+      systemInstruction: JUDGE_SYSTEM_PROMPT,
       prompt: `请分析本案争议焦点：
       
       【案件类型】：${category}
@@ -278,15 +280,14 @@ export const analyzeDisputeFocus = async (
 
   } catch (error: any) {
     console.error("Dispute Analysis Failed:", error);
-    // Return a fallback point if it fails so the app doesn't crash, but logged the error.
-    if (error.message.includes("休庭")) throw error; // Re-throw friendly error
+    if (error.message.includes("休庭")) throw error; 
     throw new Error("AI 分析服务暂时不可用，请稍后重试。");
   }
 };
 
 /**
  * Generates the final verdict.
- * EXCLUSIVELY USES GEMINI PRO.
+ * Uses GEMINI 2.0 Flash with "Experienced Judge" Persona.
  */
 export const generateVerdict = async (
   category: string,
@@ -305,7 +306,6 @@ export const generateVerdict = async (
 
   const formatEv = (items: EvidenceItem[]) => items.map(e => `[${e.type}] ${e.description}`).join('; ');
   
-  // Helper to extract base64 images
   const collectImages = (items: EvidenceItem[]) => {
     return items
       .filter(i => i.type === EvidenceType.IMAGE && i.content.startsWith('data:'))
@@ -323,13 +323,32 @@ export const generateVerdict = async (
     ...collectImages(defendantRebuttalEvidence || [])
   ];
 
-  const systemPrompt = `IDENTITY: You are the "${persona === JudgePersona.BORDER_COLLIE ? 'Border Collie Judge (Logic)' : 'Cat Judge (Empathy)'}".
+  const judgePrefix = persona === JudgePersona.BORDER_COLLIE ? '本汪裁判：' : '本喵裁判：';
+
+  // Combine user's requested persona with existing functional requirements
+  const systemPrompt = `你是一个经验丰富的 AI 法官，同时也是一位深谙亲密关系经营之道的专家。
+
+  当前人设风格: 你是 "${persona === JudgePersona.BORDER_COLLIE ? '边牧法官 (逻辑缜密, 绝对中立, 理性分析)' : '猫猫法官 (共情力强, 关注情绪事实, 治愈调解)'}".
+
+  任务: 对这起亲密关系纠纷做出最终判决。
+
+  【关键要求】:
+
+  1. **法官寄语 (finalJudgment)**:
+     - **必须以 "${judgePrefix}" 开头**。
+     - **必须逐一回应原告的诉请**: "${plaintiffDemands}"。
+     - **格式要求**: 如果有多项诉请，必须按 "1. ...\\n2. ..." 的格式分行展示。
+     - **内容结构**: 针对每一项诉请，明确给出【支持】、【驳回】或【修正/调整】的结论，并以“亲密关系中立专家”的视角，从沟通、理解、包容等角度撰写评语。
+
+  2. **补偿任务 (penaltyTasks)**:
+     - **核心目的**: 修复亲密关系 (Restoring Intimacy)。
+     - **原则**: 
+       a) 有趣味性 (Gamified/Fun)。
+       b) 可行性 (Feasible within a week)。
+       c) 贴合案情 (Case-Specific)。
+     - **禁止**: 纯金钱惩罚、无意义的枯燥劳动。
+     - **推荐**: 涉及肢体接触、深度沟通、共同体验的任务。
   
-  TASK: Issue a final verdict for a relationship dispute.
-  
-  REQUIREMENTS:
-  1. Address Plaintiff's Demands: "${plaintiffDemands}".
-  2. Penalties: Must be creative, fun, and connection-focused (e.g., "Massage for 10 mins"), NOT monetary or boring chores.
   3. Output JSON: { summary, facts[], responsibilitySplit {plaintiff, defendant}, disputeAnalyses [{title, analysis}], reasoning, finalJudgment, penaltyTasks[], tone }.`;
 
   const casePrompt = `CASE FILE:
@@ -346,7 +365,7 @@ export const generateVerdict = async (
 
   try {
     const result = await callGemini({
-      model: GEMINI_MODEL_PRO, // Mandatory High Quality
+      model: GEMINI_MODEL_PRO, // Now mapped to gemini-2.0-flash
       jsonMode: true,
       temperature: 0.7,
       systemInstruction: systemPrompt,
