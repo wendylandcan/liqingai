@@ -60,7 +60,10 @@ const GEMINI_MODEL_PRO = 'gemini-3-pro-preview';
 const GEMINI_MODEL_FALLBACK = 'gemini-flash-latest'; 
 // Simple tasks specific model (User Request)
 const GEMINI_MODEL_SIMPLE = 'gemini-1.5-flash';
-const DEEPSEEK_MODEL = 'deepseek-chat';
+
+// UPDATED: DeepSeek Model Selection
+const DEEPSEEK_CHAT_MODEL = 'deepseek-chat'; // V3
+const DEEPSEEK_REASONER_MODEL = 'deepseek-reasoner'; // R1 (High Intelligence)
 
 // --- Helper: Exponential Backoff Retry ---
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -92,9 +95,9 @@ async function retryWithBackoff<T>(operation: () => Promise<T>, retries = 4, ini
 
 /**
  * Smart Generation Strategy:
- * 1. Primary: DeepSeek V3 (Text/Logic)
- * 2. Fallback: Gemini 3 Flash/Pro if DeepSeek fails.
- * 3. Fallback Level 2: Gemini 2.5 Flash if Gemini 3 is overloaded (503).
+ * 1. Primary: DeepSeek (Reasoner for Complex, Chat for Simple)
+ * 2. Fallback: Gemini 3 Pro (Complex) or Flash (Simple) if DeepSeek fails.
+ * 3. Fallback Level 2: Gemini 2.5 Flash if Gemini 3 is overloaded.
  */
 async function smartGenerate(params: {
   systemInstruction: string;
@@ -111,17 +114,20 @@ async function smartGenerate(params: {
   const skipDeepSeek = !!params.model; 
 
   // 1. Try DeepSeek first (ONLY if NO images are present AND no specific Gemini model requested)
-  // DeepSeek via OpenAI SDK is typically text-only in this configuration.
   if (DEEPSEEK_API_KEY && !hasImages && !skipDeepSeek) {
     try {
+      // Select model based on complexity
+      const dsModel = params.complexity === 'complex' ? DEEPSEEK_REASONER_MODEL : DEEPSEEK_CHAT_MODEL;
+      const dsTemperature = params.complexity === 'complex' ? 0.6 : (params.temperature ?? 0.7);
+
       const completion = await deepseek.chat.completions.create({
         messages: [
           { role: "system", content: params.systemInstruction },
           { role: "user", content: params.prompt }
         ],
-        model: DEEPSEEK_MODEL,
+        model: dsModel,
         response_format: params.jsonMode ? { type: "json_object" } : { type: "text" },
-        temperature: params.temperature ?? 0.7,
+        temperature: dsTemperature,
       });
 
       const content = completion.choices[0].message.content;
@@ -138,9 +144,13 @@ async function smartGenerate(params: {
   // 2. Fallback to Gemini 3 Flash or Pro (Scenario B) OR Primary for Multimodal
   try {
     return await retryWithBackoff(async () => {
+      
+      // For complex tasks (like Dispute Analysis), force low temperature for stability
+      const geminiTemp = params.complexity === 'complex' ? 0.5 : (params.temperature ?? 0.7);
+      
       const config: any = {
         systemInstruction: params.systemInstruction,
-        temperature: params.temperature ?? 0.7,
+        temperature: geminiTemp,
       };
       
       if (params.jsonMode) {
@@ -150,6 +160,7 @@ async function smartGenerate(params: {
       // Determine model: Explicit > Complex/Vision > Default Flash
       let modelName = params.model;
       if (!modelName) {
+         // CRITICAL: Force Pro model for complex tasks (Dispute Analysis/Verdict)
          modelName = (params.complexity === 'complex' || hasImages) ? GEMINI_MODEL_PRO : GEMINI_MODEL_FLASH;
       }
 
@@ -385,7 +396,7 @@ export const extractFactPoints = async (narrative: string): Promise<FactCheckRes
 
 /**
  * Identifies core dispute points.
- * Logic: Switch to Gemini 1.5 Flash (Simple Task)
+ * UPGRADED: Uses DeepSeek R1 / Gemini Pro for deep reasoning.
  */
 export const analyzeDisputeFocus = async (
   category: string,
@@ -396,24 +407,45 @@ export const analyzeDisputeFocus = async (
 ): Promise<DisputePoint[]> => {
   try {
     const result = await smartGenerate({
-      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash
+      complexity: 'complex', // TRIGGER R1 or PRO model
       jsonMode: true,
-      systemInstruction: `You are an AI Judge's Assistant specializing in conflict resolution.
+      temperature: 0.6, // Slightly stricter for analysis
+      systemInstruction: `你是一名为"清官难断家务事"设计的 AI 法官助理，专门负责案件的初期梳理。
         
-        TASK: Analyze the "He said, She said" history and identify 1-3 CORE DISPUTE POINTS.
+        你的核心任务：
+        深入分析原告和被告的陈述，通过逻辑推理，挖掘出表面争吵背后的深层矛盾（如：情感忽视、价值观冲突、经济控制、家务分配不均等）。
         
-        REQUIREMENTS:
-        1. **Strict Terminology**: ALWAYS refer to the parties as "原告" (Plaintiff) and "被告" (Defendant). NEVER use "男方" (Male side), "女方" (Female side), "老公", "老婆", "男朋友", or "女朋友".
-        2. **Simple & Plain Language**: Use very simple, colloquial, easy-to-understand Chinese (通俗易懂). Avoid complex legal jargon.
-        3. **Concise**: Keep descriptions short and straight to the point (简明扼要).
-        4. **Focus**: Identify the underlying disagreement (e.g., "关于钱怎么花的矛盾" instead of "Financial Allocation Dispute").
-        
-        OUTPUT: JSON format with key "points" containing an array of objects (title, description).`,
-      prompt: `Category: ${category}
-      Plaintiff: ${plaintiffDesc}
-      Defendant: ${defenseDesc}
-      Plaintiff Rebuttal: ${plaintiffRebuttal}
-      Defendant Rebuttal: ${defendantRebuttal}`
+        分析要求：
+        1. **深度挖掘**：不要只重复用户的话，要总结出本质矛盾。例如用户说“他没洗碗”，本质可能是“家务分配不公”或“责任感缺失”。
+        2. **客观中立**：必须引用双方的具体陈述作为依据，不要偏袒。
+        3. **术语规范**：始终使用 "原告" (Plaintiff) 和 "被告" (Defendant)。禁止使用 "男方"、"女方"、"老公" 等称呼。
+        4. **通俗易懂**：用大白话解释矛盾点。
+        5. **分点陈述**：提炼 1-3 个最核心的争议焦点。不要太多，抓大放小。
+
+        输出格式（JSON）：
+        {
+          "points": [
+             {
+               "title": "简短的焦点标题 (如: 家务分配问题)",
+               "description": "详细描述该矛盾的本质，并简要提及双方的对立观点。"
+             }
+          ]
+        }`,
+      prompt: `请分析本案的争议焦点：
+
+      【案件类型】：${category}
+
+      【原告陈述】：
+      ${plaintiffDesc || "（原告未提供详细陈述）"}
+
+      【被告答辩】：
+      ${defenseDesc || "（注意：被告尚未提交正式答辩，或已缺席。请基于原告的描述，推断被告可能的立场或双方潜在的冲突点。）"}
+
+      【原告质证】：
+      ${plaintiffRebuttal || "（无）"}
+
+      【被告质证】：
+      ${defendantRebuttal || "（无）"}`
     });
 
     const parsed = JSON.parse(result);
