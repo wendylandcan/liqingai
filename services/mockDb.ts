@@ -183,6 +183,42 @@ export const MockDb = {
         return db[caseId] || null;
       }
 
+      // --- CONFLICT RESOLUTION LOGIC ---
+      // Check if the local status is "ahead" of the remote status. 
+      // This happens when we just updated the status locally (e.g., to DEBATE) 
+      // but the remote DB (or read replica) is slightly behind or this poll request 
+      // was initiated before the update completed.
+      const local = db[caseId];
+      if (local && local.status) {
+          const statusOrder = {
+            [CaseStatus.DRAFTING]: 0,
+            [CaseStatus.PLAINTIFF_EVIDENCE]: 1,
+            [CaseStatus.DEFENSE_PENDING]: 2,
+            [CaseStatus.CROSS_EXAMINATION]: 3,
+            [CaseStatus.DEBATE]: 4,
+            [CaseStatus.ADJUDICATING]: 5,
+            [CaseStatus.CLOSED]: 6,
+            [CaseStatus.CANCELLED]: 99
+          };
+          
+          const localS = local.status as CaseStatus;
+          const remoteS = remoteCase.status as CaseStatus;
+          const localLevel = statusOrder[localS] || 0;
+          const remoteLevel = statusOrder[remoteS] || 0;
+
+          // Specific fix: If local is in DEBATE (4) or ADJUDICATING (5) 
+          // and remote is still in CROSS_EXAMINATION (3), 
+          // it is extremely likely to be stale data. Ignore it.
+          if (localLevel > remoteLevel && remoteS === CaseStatus.CROSS_EXAMINATION) {
+              console.log(`[Sync] Ignoring stale remote data. Local: ${localS} > Remote: ${remoteS}`);
+              // We return null to indicate "no update needed/valid from cloud", 
+              // BUT the calling function expects CaseData. 
+              // Returning 'local' keeps the app state consistent.
+              return local;
+          }
+      }
+      // ---------------------------------
+
       // Map snake_case to camelCase
       const localCase: CaseData = {
         id: remoteCase.id,
