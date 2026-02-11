@@ -206,14 +206,16 @@ export const MockDb = {
           const localLevel = statusOrder[localS] || 0;
           const remoteLevel = statusOrder[remoteS] || 0;
 
-          // Specific fix: If local is in DEBATE (4) or ADJUDICATING (5) 
-          // and remote is still in CROSS_EXAMINATION (3), 
-          // it is extremely likely to be stale data. Ignore it.
+          // Specific fix 1: Local is DEBATE (4) or ADJUDICATING (5), Remote is CROSS_EXAMINATION (3)
           if (localLevel > remoteLevel && remoteS === CaseStatus.CROSS_EXAMINATION) {
-              console.log(`[Sync] Ignoring stale remote data. Local: ${localS} > Remote: ${remoteS}`);
-              // We return null to indicate "no update needed/valid from cloud", 
-              // BUT the calling function expects CaseData. 
-              // Returning 'local' keeps the app state consistent.
+              console.log(`[Sync] Ignoring stale remote data (Lagging). Local: ${localS} > Remote: ${remoteS}`);
+              return local;
+          }
+
+          // Specific fix 2: Local is CLOSED (6), Remote is ADJUDICATING (5)
+          // This prevents the "Flashback to Judge Selection" bug
+          if (localS === CaseStatus.CLOSED && remoteS === CaseStatus.ADJUDICATING) {
+              console.log(`[Sync] Ignoring stale remote data (Lagging Verdict). Local: CLOSED > Remote: ADJUDICATING`);
               return local;
           }
       }

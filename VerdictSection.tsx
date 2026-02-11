@@ -29,21 +29,6 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   const [plRebuttal, setPlRebuttal] = useState(data.plaintiffRebuttal);
   const [defRebuttal, setDefRebuttal] = useState(data.defendantRebuttal || "");
   
-  // Update local state when data changes from polling (to keep inputs in sync if edited elsewhere, 
-  // but be careful not to overwrite user typing if they are ahead. 
-  // Actually, for simplicity in this demo, we can just rely on local state initialization.
-  // However, since parent polls every 2s, we should probably sync if the incoming data is different 
-  // AND we are not currently editing? 
-  // Standard React pattern for controlled inputs with external updates is tricky.
-  // Given the VoiceTextarea handles its own state for the text input, we should pass `value` and `onChange`.
-  // The polling will update `data`. If we just pass `data.plaintiffRebuttal` to `value`, 
-  // the cursor might jump if we rely solely on props.
-  // But here `VoiceTextarea` is controlled by `value` prop.
-  // We use `plRebuttal` state to ensure smooth typing.
-  // We should sync `plRebuttal` if `data.plaintiffRebuttal` changes significantly (e.g. from another user),
-  // but since this is mostly single-user or separate-tab simulation, let's keep it simple.
-  // The main issue was component remounting.
-  
   // Loading state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -87,7 +72,8 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
             data.description,
             data.defenseStatement,
             data.plaintiffRebuttal,
-            data.defendantRebuttal || ""
+            data.defendantRebuttal || "",
+            data.evidence // Passed Plaintiff Evidence as requested
         );
         
         clearInterval(timer);
@@ -100,10 +86,10 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
             });
         }, 800);
 
-    } catch (e) {
+    } catch (e: any) {
         clearInterval(timer);
         console.error(e);
-        setErrorMsg("AI 分析遇到问题，请检查网络后重试。");
+        setErrorMsg(e.message || "AI 分析遇到问题，请检查网络后重试。");
     }
   };
 
@@ -230,7 +216,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
             </h3>
             
             <p className="text-slate-500 text-sm mb-6 max-w-xs mx-auto">
-                {errorMsg ? "请点击下方按钮重试" : "AI 法官正在仔细阅读双方的陈述与证据，耗时大概 30 秒，请耐心等待..."}
+                {errorMsg ? errorMsg : "AI 法官正在仔细阅读双方的陈述与证据，耗时大概 30 秒，请耐心等待..."}
             </p>
 
             <div className="w-full max-w-xs bg-slate-100 h-5 rounded-full overflow-hidden shadow-inner border border-slate-200 relative mb-2">

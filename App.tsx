@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Gavel, 
   Scale, 
@@ -203,7 +203,7 @@ const DisputeDebateStep = ({ data, onSubmit, userRole }: { data: CaseData, onSub
                     <Swords className="text-purple-600" size={32} />
                 </div>
                 <h2 className="text-xl font-bold text-purple-900 mb-2 font-cute">核心争议焦点辩论</h2>
-                <p className="text-purple-700 text-sm">AI 已基于双方陈述提炼出以下核心矛盾。请针对每个焦点进行最后的陈述。</p>
+                <p className="text-purple-700 text-sm">AI 已结合双方论述与案件事实，总结出以下核心辩论题。请针对每个问题进行回答。</p>
             </div>
 
             <div className="space-y-6">
@@ -229,7 +229,7 @@ const DisputeDebateStep = ({ data, onSubmit, userRole }: { data: CaseData, onSub
                                 {isPlaintiff ? (
                                     <VoiceTextarea 
                                         label=""
-                                        placeholder="针对此争议点，你的最终陈述..."
+                                        placeholder="针对此问题（是/否），请陈述你的理由..."
                                         value={point.plaintiffArg || ""}
                                         onChange={(val) => handleArgUpdate(point.id, val)}
                                     />
@@ -247,7 +247,7 @@ const DisputeDebateStep = ({ data, onSubmit, userRole }: { data: CaseData, onSub
                                 {isDefendant ? (
                                     <VoiceTextarea 
                                         label=""
-                                        placeholder="针对此争议点，你的最终陈述..."
+                                        placeholder="针对此问题（是/否），请陈述你的理由..."
                                         value={point.defendantArg || ""}
                                         onChange={(val) => handleArgUpdate(point.id, val)}
                                     />
@@ -691,8 +691,16 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
   const [loading, setLoading] = useState(true);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showDefaultJudgmentConfirm, setShowDefaultJudgmentConfirm] = useState(false);
+  
+  // Use ref to track the time of the last local update action
+  const lastActionTimeRef = useRef<number>(0);
 
   const load = async () => {
+    // Prevent overwriting local optimistic updates with stale server data immediately after a user action (5s buffer)
+    if (Date.now() - lastActionTimeRef.current < 5000) {
+        return;
+    }
+
     // Sync from cloud instead of just local get to ensure multi-user updates are reflected
     const c = await MockDb.syncCaseFromCloud(caseId);
     if (c) setData(c);
@@ -708,6 +716,10 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
 
   const update = async (patch: Partial<CaseData>) => {
     if (!data) return;
+    
+    // Mark the timestamp of this local action
+    lastActionTimeRef.current = Date.now();
+    
     // Update local state and sync with Supabase async
     const updated = await MockDb.updateCase(data.id, patch);
     setData(updated);

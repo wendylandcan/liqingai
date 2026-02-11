@@ -1,32 +1,24 @@
-import { GoogleGenAI, Type } from "@google/genai";
-import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
 import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, DisputePoint, EvidenceType } from "../types";
 
 // --- Environment Configuration ---
 
-// Helper to safely get env vars in both Vite (browser) and standard Node/Polyfill environments
+// Helper to safely get env vars
 const getEnvVar = (key: string, viteKey: string): string => {
-  // 1. Try Vite's import.meta.env
   try {
     // @ts-ignore
     if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[viteKey]) {
       // @ts-ignore
       return import.meta.env[viteKey];
     }
-  } catch (e) {
-    // Ignore errors if import.meta is not supported
-  }
+  } catch (e) {}
 
-  // 2. Try process.env
   try {
     if (typeof process !== 'undefined' && process.env && process.env[key]) {
       return process.env[key]!;
     }
-  } catch (e) {
-    // Ignore errors
-  }
+  } catch (e) {}
 
-  // 3. Fallback specifically for Gemini API_KEY as per system rules if strictly injected
   if (key === 'API_KEY' && typeof process !== 'undefined' && process.env && process.env.API_KEY) {
       return process.env.API_KEY;
   }
@@ -35,368 +27,194 @@ const getEnvVar = (key: string, viteKey: string): string => {
 };
 
 // Keys
-const DEEPSEEK_API_KEY = getEnvVar('DEEPSEEK_API_KEY', 'VITE_DEEPSEEK_API_KEY');
-const GEMINI_API_KEY = getEnvVar('API_KEY', 'VITE_GEMINI_API_KEY'); // Falls back to process.env.API_KEY
+const GEMINI_API_KEY = getEnvVar('API_KEY', 'VITE_GEMINI_API_KEY');
 
-// --- Initialize Clients ---
-
-// 1. Gemini Client (For Multimodal & Fallback)
-// Note: We use the resolved GEMINI_API_KEY which supports both process.env.API_KEY and VITE_GEMINI_API_KEY
+// --- Initialize Client ---
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY || process.env.API_KEY });
 
-// 2. DeepSeek Client (For Primary Text Logic)
-// Note: DeepSeek is OpenAI-compatible
-const deepseek = new OpenAI({
-  apiKey: DEEPSEEK_API_KEY,
-  baseURL: "https://api.deepseek.com",
-  dangerouslyAllowBrowser: true // Allowed for client-side demo; use backend proxy in production
-});
-
 // --- Model Constants ---
-// Scenario A & B requirements: Use Flash for Audio and Fallback
-const GEMINI_MODEL_FLASH = 'gemini-3-flash-preview';
-const GEMINI_MODEL_PRO = 'gemini-3-pro-preview';
-// CHANGED: Use a stable model for fallback (Gemini 2.5 Flash alias)
-const GEMINI_MODEL_FALLBACK = 'gemini-flash-latest'; 
-// Simple tasks specific model (User Request)
-const GEMINI_MODEL_SIMPLE = 'gemini-1.5-flash';
+// Use Flash for simple tasks (speed)
+const GEMINI_MODEL_FLASH = 'gemini-3-flash-preview'; 
+// Use Pro for complex analysis (replacing DeepSeek/Gemini 1.5 Pro requirement with latest Pro model)
+const GEMINI_MODEL_PRO = 'gemini-3-pro-preview'; 
 
-// UPDATED: DeepSeek Model Selection
-const DEEPSEEK_CHAT_MODEL = 'deepseek-chat'; // V3
-const DEEPSEEK_REASONER_MODEL = 'deepseek-reasoner'; // R1 (High Intelligence)
-
-// --- Helper: Exponential Backoff Retry ---
+// --- Helper: Retry Logic ---
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function retryWithBackoff<T>(operation: () => Promise<T>, retries = 4, initialDelay = 2000): Promise<T> {
+async function retryWithBackoff<T>(operation: () => Promise<T>, retries = 3, initialDelay = 2000): Promise<T> {
   let lastError;
   for (let i = 0; i < retries; i++) {
     try {
       return await operation();
     } catch (error: any) {
       lastError = error;
-      // Check for common overload/rate-limit status codes or messages
       const status = error?.status || error?.code;
       const message = error?.message || '';
-      // 503 is "Service Unavailable" (High Demand), 429 is "Too Many Requests"
-      const isTransient = status === 503 || status === 429 || status === 500 || message.includes('overloaded') || message.includes('busy') || message.includes('demand');
+      // Retry on transient errors
+      const isTransient = status === 503 || status === 429 || status === 500 || message.includes('overloaded');
       
       if (isTransient && i < retries - 1) {
-        const waitTime = initialDelay * Math.pow(2, i); // 2s, 4s, 8s, 16s
-        console.warn(`AI Busy (Attempt ${i + 1}/${retries}). Retrying in ${waitTime}ms...`, message);
-        await delay(waitTime);
+        await delay(initialDelay * Math.pow(2, i));
         continue;
       }
-      throw error; // Throw immediately if not a transient error or retries exhausted
+      throw error;
     }
   }
   throw lastError;
 }
 
 /**
- * Smart Generation Strategy:
- * 1. Primary: DeepSeek (Reasoner for Complex, Chat for Simple)
- * 2. Fallback: Gemini 3 Pro (Complex) or Flash (Simple) if DeepSeek fails.
- * 3. Fallback Level 2: Gemini 2.5 Flash if Gemini 3 is overloaded.
+ * Core Gemini Generation Function
  */
-async function smartGenerate(params: {
-  systemInstruction: string;
+async function callGemini(params: {
+  model: string;
+  systemInstruction?: string;
   prompt: string;
-  jsonMode?: boolean;
   temperature?: number;
-  complexity?: 'simple' | 'complex';
-  images?: { inlineData: { data: string, mimeType: string } }[]; // Support for images
-  model?: string; // Explicit model request
+  jsonMode?: boolean;
+  images?: { inlineData: { data: string, mimeType: string } }[];
 }): Promise<string> {
-  
-  const hasImages = params.images && params.images.length > 0;
-  // If specific model is requested (e.g. Gemini 1.5 Flash), skip DeepSeek to honor the request
-  const skipDeepSeek = !!params.model; 
-
-  // 1. Try DeepSeek first (ONLY if NO images are present AND no specific Gemini model requested)
-  if (DEEPSEEK_API_KEY && !hasImages && !skipDeepSeek) {
-    try {
-      // Select model based on complexity
-      const dsModel = params.complexity === 'complex' ? DEEPSEEK_REASONER_MODEL : DEEPSEEK_CHAT_MODEL;
-      const dsTemperature = params.complexity === 'complex' ? 0.6 : (params.temperature ?? 0.7);
-
-      const completion = await deepseek.chat.completions.create({
-        messages: [
-          { role: "system", content: params.systemInstruction },
-          { role: "user", content: params.prompt }
-        ],
-        model: dsModel,
-        response_format: params.jsonMode ? { type: "json_object" } : { type: "text" },
-        temperature: dsTemperature,
-      });
-
-      const content = completion.choices[0].message.content;
-      if (content) return content;
-      throw new Error("DeepSeek returned empty content");
-    } catch (error) {
-      console.warn("DeepSeek API unavailable or failed. Switching to Gemini Fallback strategy...", error);
-      // Proceed to Gemini fallback
-    }
-  } else if (hasImages) {
-    console.log("Multimodal input detected (Images). Skipping DeepSeek, using Gemini.");
-  }
-
-  // 2. Fallback to Gemini 3 Flash or Pro (Scenario B) OR Primary for Multimodal
   try {
     return await retryWithBackoff(async () => {
-      
-      // For complex tasks (like Dispute Analysis), force low temperature for stability
-      const geminiTemp = params.complexity === 'complex' ? 0.5 : (params.temperature ?? 0.7);
-      
       const config: any = {
         systemInstruction: params.systemInstruction,
-        temperature: geminiTemp,
+        temperature: params.temperature ?? 0.7, // Default to 0.7 as requested for flexibility
       };
-      
+
       if (params.jsonMode) {
         config.responseMimeType = "application/json";
       }
 
-      // Determine model: Explicit > Complex/Vision > Default Flash
-      let modelName = params.model;
-      if (!modelName) {
-         // CRITICAL: Force Pro model for complex tasks (Dispute Analysis/Verdict)
-         modelName = (params.complexity === 'complex' || hasImages) ? GEMINI_MODEL_PRO : GEMINI_MODEL_FLASH;
-      }
-
-      // Construct contents
       let contentsInput: any;
-      if (hasImages) {
-        // Multimodal structure: [Text, Image1, Image2...]
+      if (params.images && params.images.length > 0) {
         contentsInput = {
           parts: [
             { text: params.prompt },
-            ...params.images!
+            ...params.images
           ]
         };
       } else {
-        // Text-only structure
         contentsInput = params.prompt;
       }
 
-      // Function to try a specific model
-      const tryModel = async (m: string) => {
-        const response = await ai.models.generateContent({
-            model: m,
-            contents: contentsInput,
-            config: config
-        });
-        return response.text || "";
-      };
+      const response = await ai.models.generateContent({
+        model: params.model,
+        contents: contentsInput,
+        config: config
+      });
 
-      try {
-        return await tryModel(modelName!);
-      } catch (error: any) {
-        // Check for error codes to trigger fallback
-        const code = error?.status || error?.code;
-        const msg = error?.message || "";
-        
-        // Handle 503 (Service Unavailable/Overloaded), 500 (Server Error), 404 (Not Found)
-        // Note: if user requested specific model, we still fallback if it fails, but fallback to stable 2.5/latest
-        if (code === 503 || code === 500 || code === 404 || msg.includes('demand') || msg.includes('overloaded')) {
-            console.warn(`Model ${modelName} failed with ${code}. Trying fallback ${GEMINI_MODEL_FALLBACK}...`);
-            return await tryModel(GEMINI_MODEL_FALLBACK);
-        }
-        throw error;
-      }
+      return response.text || "";
     });
   } catch (error) {
-    console.error("Critical: All AI services failed.", error);
-    throw error;
+    console.error("Gemini API Error:", error);
+    throw new Error("AI 法官正在休庭，请稍后重试");
   }
 }
 
-/**
- * Transcribes audio blob to text using Gemini.
- * SCENARIO A: Multimodal Input -> Direct Gemini Call
- * SKILL: Audio Coherence & Filler Removal
- */
+// --- Public Services ---
+
 export const transcribeAudio = async (base64Audio: string, mimeType: string): Promise<string> => {
   try {
-    return await retryWithBackoff(async () => {
-      const response = await ai.models.generateContent({
-        model: GEMINI_MODEL_FLASH, // Keep using Gemini 3 Flash for Audio (Native Audio support)
-        config: {
-          systemInstruction: `You are an expert transcriber equipped with the "Coherence" skill package.
-          
-          YOUR MANDATE:
-          1. Transcribe the audio exactly but intelligently.
-          2. FILTER OUT: All filler words (uh, um, like, you know, sort of), stutters, and hesitations.
-          3. PUNCTUATION: You MUST add proper punctuation (commas, periods, question marks) to make the transcript readable.
-          4. OUTPUT: Return ONLY the clean, coherent text with punctuation. No introductory phrases.`
-        },
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: base64Audio,
-              },
-            },
-            {
-              text: "Transcribe this audio.",
-            },
-          ],
-        },
-      });
-      return response.text?.trim() || "";
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL_FLASH,
+      config: {
+        systemInstruction: `You are an expert transcriber. Filter out fillers. Add punctuation.`
+      },
+      contents: {
+        parts: [
+          { inlineData: { mimeType: mimeType, data: base64Audio } },
+          { text: "Transcribe this audio." },
+        ],
+      },
     });
+    return response.text?.trim() || "";
   } catch (error) {
     console.error("Transcription Error", error);
-    return "（语音转录失败，请重试或手动输入）";
+    return "（语音转录失败，请重试）";
   }
 };
 
-/**
- * Summarizes a statement into a concise paragraph.
- */
 export const summarizeStatement = async (text: string, role: string): Promise<string> => {
   if (!text) return "";
   try {
-    const result = await smartGenerate({
-      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash
-      systemInstruction: `You are a legal summarizer for a relationship court. 
-      TASK: Summarize the ${role}'s statement into a concise paragraph (approx 50-100 Chinese characters).
-      GOAL: Retain key facts and emotional stance, but remove redundancy. Make it easy to read for the opposing party.`,
+    return await callGemini({
+      model: GEMINI_MODEL_FLASH,
+      systemInstruction: `Summarize the ${role}'s statement into 50-100 Chinese characters. Retain facts and emotion.`,
       prompt: `Statement: "${text}"`
     });
-    return result.trim();
   } catch (error) {
-    console.error("Summary Generation Error", error);
-    return text.slice(0, 150) + (text.length > 150 ? "..." : "");
+    return text.slice(0, 150) + "...";
   }
 };
 
-/**
- * Generates a short, catchy title for the case.
- * Logic: DeepSeek -> Gemini Flash Fallback (Default)
- */
 export const generateCaseTitle = async (description: string): Promise<string> => {
-  if (!description) return "";
   try {
-    const result = await smartGenerate({
-      systemInstruction: `You are a legal copywriter for a relationship court.
-        
-        TASK: Summarize the dispute into a short, punchy title (max 12 Chinese characters).
-        STYLE: Dramatic but accurate (e.g., "纪念日爽约案").
-        CONSTRAINT: No quotes, no markdown, just the text.`,
-      prompt: `Case Description: "${description}"`
+    const res = await callGemini({
+      model: GEMINI_MODEL_FLASH,
+      systemInstruction: `Summarize into a short title (max 12 chars). No quotes.`,
+      prompt: `Case: "${description}"`
     });
-    return result.trim() || description.slice(0, 10) + "案件";
-  } catch (error) {
-    console.error("Title Generation Error", error);
-    return description.slice(0, 8) + "...案件";
+    return res.trim();
+  } catch (e) {
+    return "未命名案件";
   }
 };
 
-/**
- * Superpower: Polishes text to be more objective and calm.
- * Logic: DeepSeek -> Gemini Flash Fallback (Default)
- * SKILL: NVC Filter
- */
 export const polishText = async (text: string): Promise<string> => {
-  if (!text) return "";
   try {
-    const result = await smartGenerate({
-      systemInstruction: `You are the "Superpower" AI Assistant: The Objective Reality Filter.
-        
-        YOUR SKILL PACKAGE:
-        1. DE-ESCALATE: Remove all profanity, insults, and purely emotional outbursts.
-        2. CLARIFY: Rewrite the text to focus on the Who, What, When, Where, and Why.
-        3. NORMALIZE: Convert subjective judgments ("You are lazy") into objective observations ("The chores were not done").
-        4. PRESERVE: Keep the user's original point and facts intact.
-        
-        OUTPUT: Return ONLY the polished text.`,
-      prompt: `Original Text: "${text}"`
-    });
-    return result.trim() || text;
-  } catch (error) {
-    console.error("Polish Error", error);
-    return text;
-  }
-};
-
-/**
- * Fixes grammar and removes filler words for speech input.
- * Use simple model for speed.
- */
-export const fixGrammar = async (text: string): Promise<string> => {
-  if (!text || text.length < 2) return text;
-  try {
-    const result = await smartGenerate({
-      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash for speed
-      systemInstruction: `You are a text cleaner and proofreader for a voice-input tool.
-      
-      TASK: Clean up the spoken text provided by the user.
-      
-      RULES:
-      1. PUNCTUATION (CRITICAL): The input text is raw speech-to-text without punctuation. You MUST insert proper punctuation (commas, periods, question marks) to make it a fluent, readable paragraph.
-      2. REMOVE FILLER WORDS: Delete spoken fillers like "uh", "um", "ah", "那个", "就是", "然后" (when used as filler), "呃", "啊".
-      3. FIX FLUENCY: Repair sentence fragments, stuttering, or repeated words.
-      4. PRESERVE MEANING: Do NOT change the original meaning.
-      5. PRESERVE EMOTION: Do NOT tone down anger or happiness. Keep the original tone.
-      
-      OUTPUT: Return ONLY the cleaned, punctuated text.`,
-      prompt: `Spoken Text: "${text}"`
-    });
-    return result.trim() || text;
-  } catch (error) {
-    console.error("Grammar Fix Error", error);
-    return text;
-  }
-};
-
-/**
- * Analyzes text for extreme emotions.
- * Logic: DeepSeek -> Gemini Flash Fallback (Default)
- */
-export const analyzeSentiment = async (text: string): Promise<SentimentResult> => {
-  if (!text) return { isToxic: false, score: 0, reason: "" };
-  try {
-    const result = await smartGenerate({
-      jsonMode: true,
-      systemInstruction: `You are a toxicity detector for a relationship dispute app.
-        Analyze the text for: Verbal abuse, extreme anger, personal attacks, or threats.
-        OUTPUT: JSON format with keys: isToxic (boolean), score (number 0-10), reason (string).`,
+    return await callGemini({
+      model: GEMINI_MODEL_FLASH,
+      systemInstruction: `Remove profanity. Normalize judgments. Keep facts. Output only clean text.`,
       prompt: `Text: "${text}"`
     });
-
-    return JSON.parse(result) as SentimentResult;
-  } catch (error) {
-    console.error("Sentiment Analysis Error", error);
-    return { isToxic: false, score: 0, reason: "系统繁忙，跳过情绪检测" };
+  } catch (e) {
+    return text;
   }
 };
 
-/**
- * Extracts objective fact points.
- * Logic: Switch to Gemini 1.5 Flash (Simple Task)
- */
+export const fixGrammar = async (text: string): Promise<string> => {
+  try {
+    return await callGemini({
+      model: GEMINI_MODEL_FLASH,
+      systemInstruction: `Add punctuation. Remove fillers (uh, um). Fix fragments. Keep tone.`,
+      prompt: `Text: "${text}"`
+    });
+  } catch (e) {
+    return text;
+  }
+};
+
+export const analyzeSentiment = async (text: string): Promise<SentimentResult> => {
+  try {
+    const res = await callGemini({
+      model: GEMINI_MODEL_FLASH,
+      jsonMode: true,
+      systemInstruction: `Analyze for toxicity. Return JSON: {isToxic, score, reason}.`,
+      prompt: `Text: "${text}"`
+    });
+    return JSON.parse(res);
+  } catch (e) {
+    return { isToxic: false, score: 0, reason: "" };
+  }
+};
+
 export const extractFactPoints = async (narrative: string): Promise<FactCheckResult> => {
   try {
-    const result = await smartGenerate({
-      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash
+    const res = await callGemini({
+      model: GEMINI_MODEL_FLASH,
       jsonMode: true,
-      systemInstruction: `Extract a list of objective facts (Fact Points) from the narrative. Ignore opinions and emotional fluff.
-      OUTPUT: JSON format with key "facts" (array of strings).`,
+      systemInstruction: `Extract objective facts. Return JSON: {facts: string[]}.`,
       prompt: `Narrative: "${narrative}"`
     });
-
-    return JSON.parse(result) as FactCheckResult;
-  } catch (error) {
-    console.error("Fact Extraction Error", error);
+    return JSON.parse(res);
+  } catch (e) {
     return { facts: [] };
   }
 };
 
 /**
  * Identifies core dispute points.
- * UPGRADED: Uses DeepSeek R1 / Gemini Pro for deep reasoning.
+ * NOW EXCLUSIVELY USES GEMINI PRO (High Quality).
  */
 export const analyzeDisputeFocus = async (
   category: string,
@@ -404,72 +222,71 @@ export const analyzeDisputeFocus = async (
   defenseDesc: string,
   plaintiffRebuttal: string,
   defendantRebuttal: string,
+  plaintiffEvidence: EvidenceItem[] // Added Plaintiff Evidence
 ): Promise<DisputePoint[]> => {
+  
+  // Format evidence for prompt
+  const evidenceText = plaintiffEvidence.length > 0 
+    ? plaintiffEvidence.map((e, i) => `${i+1}. [${e.type}] ${e.description || '无描述'}`).join('\n') 
+    : "（未提交主要证据）";
+
   try {
-    const result = await smartGenerate({
-      complexity: 'complex', // TRIGGER R1 or PRO model
+    const result = await callGemini({
+      model: GEMINI_MODEL_PRO, // Mandatory High Quality Model
       jsonMode: true,
-      temperature: 0.6, // Slightly stricter for analysis
-      systemInstruction: `你是一名为"清官难断家务事"设计的 AI 法官助理，专门负责案件的初期梳理。
-        
-        你的核心任务：
-        深入分析原告和被告的陈述，通过逻辑推理，挖掘出表面争吵背后的深层矛盾（如：情感忽视、价值观冲突、经济控制、家务分配不均等）。
-        
-        分析要求：
-        1. **深度挖掘**：不要只重复用户的话，要总结出本质矛盾。例如用户说“他没洗碗”，本质可能是“家务分配不公”或“责任感缺失”。
-        2. **客观中立**：必须引用双方的具体陈述作为依据，不要偏袒。
-        3. **术语规范**：始终使用 "原告" (Plaintiff) 和 "被告" (Defendant)。禁止使用 "男方"、"女方"、"老公" 等称呼。
-        4. **通俗易懂**：用大白话解释矛盾点。
-        5. **分点陈述**：提炼 1-3 个最核心的争议焦点。不要太多，抓大放小。
-
-        输出格式（JSON）：
-        {
-          "points": [
-             {
-               "title": "简短的焦点标题 (如: 家务分配问题)",
-               "description": "详细描述该矛盾的本质，并简要提及双方的对立观点。"
-             }
-          ]
-        }`,
-      prompt: `请分析本案的争议焦点：
-
+      temperature: 0.7, // As requested for flexibility
+      systemInstruction: `你是一位公正、深刻的 AI 法官。请根据原告和被告的陈述，分析案件的核心争议焦点。你的分析必须深入具体，拒绝笼统的套话，并明确引用双方的陈述作为依据。
+      
+      你的输出任务：
+      1. 提炼 1-3 个最核心的争议焦点。
+      2. 每个焦点的描述必须是一个具体的【是/否问句】（Yes/No Question），供双方辩论。
+      
+      输出 JSON 格式：
+      {
+        "points": [
+           {
+             "title": "简短标题",
+             "description": "具体的 是/否 辩论问句"
+           }
+        ]
+      }`,
+      prompt: `请分析本案争议焦点：
+      
       【案件类型】：${category}
-
+      
       【原告陈述】：
-      ${plaintiffDesc || "（原告未提供详细陈述）"}
+      ${plaintiffDesc || "（空）"}
+      
+      【原告证据】：
+      ${evidenceText}
 
       【被告答辩】：
-      ${defenseDesc || "（注意：被告尚未提交正式答辩，或已缺席。请基于原告的描述，推断被告可能的立场或双方潜在的冲突点。）"}
-
+      ${defenseDesc || "（被告缺席或未详细答辩）"}
+      
       【原告质证】：
       ${plaintiffRebuttal || "（无）"}
-
+      
       【被告质证】：
       ${defendantRebuttal || "（无）"}`
     });
 
     const parsed = JSON.parse(result);
-    const points = parsed.points || [];
-    
-    return points.map((p: any, index: number) => ({
-        ...p,
-        id: p.id ? String(p.id) : `focus-${index}-${Date.now()}`
-    })) as DisputePoint[];
+    return parsed.points.map((p: any, index: number) => ({
+      ...p,
+      id: p.id ? String(p.id) : `focus-${index}-${Date.now()}`
+    }));
 
-  } catch (error) {
-    console.error("Dispute Analysis Error", error);
-    return [{
-      id: "default-1",
-      title: "核心矛盾",
-      description: "关于双方对于事件认知和责任认定的根本分歧。"
-    }];
+  } catch (error: any) {
+    console.error("Dispute Analysis Failed:", error);
+    // Return a fallback point if it fails so the app doesn't crash, but logged the error.
+    if (error.message.includes("休庭")) throw error; // Re-throw friendly error
+    throw new Error("AI 分析服务暂时不可用，请稍后重试。");
   }
 };
 
 /**
  * Generates the final verdict.
- * Logic: DeepSeek -> Gemini Flash Fallback (Complex Task / Pro)
- * SKILL: Persona-Based Adjudication & Intimate Relationship Expert
+ * EXCLUSIVELY USES GEMINI PRO.
  */
 export const generateVerdict = async (
   category: string,
@@ -485,99 +302,20 @@ export const generateVerdict = async (
   disputePoints: DisputePoint[],
   persona: JudgePersona
 ): Promise<Verdict> => {
+
+  const formatEv = (items: EvidenceItem[]) => items.map(e => `[${e.type}] ${e.description}`).join('; ');
   
-  let systemInstruction = "";
-  
-  // Base Persona
-  if (persona === JudgePersona.BORDER_COLLIE) {
-    systemInstruction = `IDENTITY: You are the "Border Collie Judge" (汪汪法官).
-    TRAITS: Highly logical, rules-obsessed, neutral, uses "本汪" (This Dog).
-    FOCUS: Fact-checking and adherence to agreed-upon rules/logic.`;
-  } else {
-    systemInstruction = `IDENTITY: You are the "Cat Judge" (喵喵法官).
-    TRAITS: Empathetic, focuses on emotional truth, comforting but sassy, uses "本喵" (This Cat).
-    FOCUS: Emotional needs and relationship dynamics.`;
-  }
-
-  // Check for Default Judgment Scenario
-  // If disputePoints is empty or defenseDesc indicates absence
-  const isDefaultJudgment = defenseDesc.includes("被告缺席") || disputePoints.length === 0;
-
-  if (isDefaultJudgment) {
-    systemInstruction += `
-    
-    SPECIAL SCENARIO: DEFAULT JUDGMENT (Defendant Absent).
-    1. The defendant has waived their right to defend.
-    2. You must evaluate the case based PRIMARILY on whether the Plaintiff's claims are logical and supported by their evidence.
-    3. You do not need to find a "middle ground". If the plaintiff makes sense, rule in their favor (e.g., 100/0 or 90/10).
-    4. "disputeAnalyses" should focus on the validity of the Plaintiff's key demands since there is no counter-argument.
-    `;
-  }
-
-  // EXPERT & VERDICT LOGIC INSTRUCTIONS
-  systemInstruction += `
-  
-  CRITICAL TERMINOLOGY RULE:
-  - ALWAYS use "原告" (Plaintiff) and "被告" (Defendant) to refer to the parties.
-  - DO NOT use gendered terms like "男方", "女方", "男朋友", "女朋友", "老公", "老婆".
-  
-  CORE RESPONSIBILITIES (Relationship Expert Mode):
-  1. **Final Judgment (finalJudgment)**: 
-     - You MUST explicitly address the Plaintiff's DEMANDS ("${plaintiffDemands}").
-     - Combine the "Dispute Points" analysis to explain WHY you are granting, denying, or modifying these demands.
-     - Provide closure.
-
-  2. **Compensation/Penalty Tasks (penaltyTasks)**:
-     - **IDENTITY**: You are not just a Judge, but a **Top-tier Intimacy Coach (亲密关系经营专家)**.
-     - **PHILOSOPHY**: "Punishment" is just a disguised opportunity for connection.
-     - **REQUIREMENTS**:
-       a) **Fun & Creative**: Avoid boring chores. Use gamification (e.g., "Roleplay", "Love Coupons", "Truth or Dare").
-       b) **Case-Specific**: If the dispute is about housework, the task shouldn't just be "do housework", it should be "Do housework while the other person feeds them fruit".
-       c) **Feasible**: Tasks must be doable within a week.
-       d) **Connection-Focused (Restorative)**: Must involve eye contact, physical touch (hug/massage), or deep listening.
-     - **EXAMPLES (GOOD)**:
-       - "Lose side must give a 15-min full back massage while listening to the Winner's favorite playlist."
-       - "Winner picks a movie, Loser prepares snacks and stays off phone for the whole movie."
-       - "Write 3 things you appreciate about the partner on sticky notes and hide them around the house."
-       - "Re-enact the argument using only animal noises (Meow/Woof) to break the tension."
-     - **EXAMPLES (BAD)**:
-       - "Pay 500 RMB." (Too transactional)
-       - "Do all dishes for a month." (Breeds resentment, too long)
-
-  3. **Dispute Analysis (disputeAnalyses)**:
-     - For each core dispute point, provide a final ruling/insight based on the debate arguments.
-  
-  OUTPUT REQUIREMENT:
-  You must output valid JSON.
-  Schema keys required: 
-  - summary (string)
-  - facts (array of strings)
-  - responsibilitySplit (object {plaintiff: number, defendant: number} - must sum to 100)
-  - disputeAnalyses (array of objects {title: string, analysis: string})
-  - reasoning (string)
-  - finalJudgment (string - Address the demands!)
-  - penaltyTasks (array of strings - Creative & Preventive)
-  - tone (string)
-  `;
-
-  // Helper to extract base64 images from evidence items
+  // Helper to extract base64 images
   const collectImages = (items: EvidenceItem[]) => {
     return items
       .filter(i => i.type === EvidenceType.IMAGE && i.content.startsWith('data:'))
       .map(i => {
-        // format: "data:image/png;base64,....."
         const [meta, data] = i.content.split(',');
         const mimeType = meta.match(/:(.*?);/)?.[1] || 'image/jpeg';
-        return { 
-          inlineData: { 
-            data, 
-            mimeType 
-          } 
-        };
+        return { inlineData: { data, mimeType } };
       });
   };
 
-  // Collect all images from both sides
   const allImages = [
     ...collectImages(plaintiffEvidence),
     ...collectImages(defendantEvidence),
@@ -585,75 +323,45 @@ export const generateVerdict = async (
     ...collectImages(defendantRebuttalEvidence || [])
   ];
 
-  const formatEvidence = (items: EvidenceItem[]) => 
-    items.map(e => `[${e.type === 'TEXT' ? '文字' : '图片'}] ${e.description || '无描述'} (Contested: ${e.isContested ? 'Yes' : 'No'})`).join('\n') || "None";
+  const systemPrompt = `IDENTITY: You are the "${persona === JudgePersona.BORDER_COLLIE ? 'Border Collie Judge (Logic)' : 'Cat Judge (Empathy)'}".
+  
+  TASK: Issue a final verdict for a relationship dispute.
+  
+  REQUIREMENTS:
+  1. Address Plaintiff's Demands: "${plaintiffDemands}".
+  2. Penalties: Must be creative, fun, and connection-focused (e.g., "Massage for 10 mins"), NOT monetary or boring chores.
+  3. Output JSON: { summary, facts[], responsibilitySplit {plaintiff, defendant}, disputeAnalyses [{title, analysis}], reasoning, finalJudgment, penaltyTasks[], tone }.`;
 
-  const formatDebate = (points: DisputePoint[]) => {
-      if (!points || points.length === 0) return "None (Default Judgment / No Debate)";
-      return points.map(p => `
-        [Dispute Point]: ${p.title}
-        [Description]: ${p.description}
-        [Plaintiff's Final Argument]: ${p.plaintiffArg || "Waived"}
-        [Defendant's Final Argument]: ${p.defendantArg || "Waived"}
-      `).join('\n');
-  };
-
-  const caseDetails = `
-    CASE FILE:
-    Category: ${category}
-    
-    --- PHASE 1: INITIAL STATEMENTS ---
-    PLAINTIFF STATEMENT: "${plaintiffDesc}"
-    **PLAINTIFF DEMANDS**: "${plaintiffDemands}"
-    
-    DEFENDANT DEFENSE: "${defenseDesc}"
-
-    --- PHASE 2: EVIDENCE & REBUTTALS ---
-    Plaintiff Evidence: ${formatEvidence(plaintiffEvidence)}
-    Defendant Evidence: ${formatEvidence(defendantEvidence)}
-    Plaintiff Rebuttal: "${plaintiffRebuttal}"
-    Defendant Rebuttal: "${defendantRebuttal}"
-
-    --- PHASE 3: FINAL DEBATE ON CORE DISPUTES ---
-    ${formatDebate(disputePoints)}
+  const casePrompt = `CASE FILE:
+  Category: ${category}
+  Plaintiff: ${plaintiffDesc}
+  Defense: ${defenseDesc}
+  
+  Evidence (P): ${formatEv(plaintiffEvidence)}
+  Evidence (D): ${formatEv(defendantEvidence)}
+  
+  Debate Points:
+  ${disputePoints.map(p => `- Q: ${p.title}? P: ${p.plaintiffArg} vs D: ${p.defendantArg}`).join('\n')}
   `;
 
   try {
-    const result = await smartGenerate({
-      complexity: 'complex', // Use Pro model for verdict if using Gemini fallback
+    const result = await callGemini({
+      model: GEMINI_MODEL_PRO, // Mandatory High Quality
       jsonMode: true,
-      systemInstruction: systemInstruction,
-      prompt: `Perform your judgment task as an expert relationship judge on this case. ${allImages.length > 0 ? '(Visual Evidence Included in this request)' : ''}\n${caseDetails}`,
-      images: allImages // Pass the extracted images
+      temperature: 0.7,
+      systemInstruction: systemPrompt,
+      prompt: casePrompt,
+      images: allImages
     });
 
     const parsed = JSON.parse(result);
-    
-    // Sanitize penaltyTasks to ensure strings
-    if (parsed.penaltyTasks && Array.isArray(parsed.penaltyTasks)) {
-      parsed.penaltyTasks = parsed.penaltyTasks.map((t: any) => {
-        if (typeof t === 'string') return t;
-        // Flatten object if AI hallucinations created a structured object
-        if (typeof t === 'object' && t !== null) {
-             if (t.taskName && t.description) return `${t.taskName}: ${t.description}`;
-             return Object.values(t).join(': ');
-        }
-        return String(t);
-      });
+    // Sanitize penaltyTasks to string[]
+    if (parsed.penaltyTasks) {
+       parsed.penaltyTasks = parsed.penaltyTasks.map((t: any) => typeof t === 'string' ? t : JSON.stringify(t));
     }
-
-    return parsed as Verdict;
+    return parsed;
   } catch (error) {
-    console.error("Verdict Generation Error", error);
-    return {
-        summary: "AI 判决暂时不可用",
-        facts: [],
-        responsibilitySplit: { plaintiff: 50, defendant: 50 },
-        reasoning: "连接 AI 服务时出错，请检查 API Key 或网络（可能由于服务过载）。",
-        finalJudgment: "抱歉，本法官暂时掉线了，请稍后再试。",
-        penaltyTasks: [],
-        tone: "系统错误",
-        disputeAnalyses: []
-    };
+    console.error("Verdict Generation Failed:", error);
+    throw new Error("AI 法官正在休庭，请稍后重试");
   }
 };
