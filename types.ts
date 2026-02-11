@@ -4,6 +4,7 @@ export enum CaseStatus {
   PLAINTIFF_EVIDENCE = 'PLAINTIFF_EVIDENCE', // Plaintiff is adding initial evidence
   DEFENSE_PENDING = 'DEFENSE_PENDING', // Waiting for Defendant to join/respond
   CROSS_EXAMINATION = 'CROSS_EXAMINATION', // Both parties can rebut/cross-examine
+  DEBATE = 'DEBATE', // New: Core dispute focus debate
   ADJUDICATING = 'ADJUDICATING', // AI is processing
   CLOSED = 'CLOSED', // Verdict delivered
   CANCELLED = 'CANCELLED', // Case cancelled by plaintiff
@@ -35,6 +36,19 @@ export interface EvidenceItem {
   submittedBy: UserRole;
 }
 
+export interface DisputePoint {
+  id: string;
+  title: string;
+  description: string;
+  plaintiffArg?: string; // Argument from Plaintiff
+  defendantArg?: string; // Argument from Defendant
+}
+
+export interface DisputeAnalysis {
+  title: string;
+  analysis: string;
+}
+
 export interface CaseData {
   id: string;
   shareCode: string; // 6-digit code for defendant to join
@@ -64,6 +78,9 @@ export interface CaseData {
   defendantRebuttal: string;
   defendantRebuttalEvidence: EvidenceItem[];
 
+  // Debate Phase
+  disputePoints: DisputePoint[];
+
   judgePersona: JudgePersona;
   status: CaseStatus;
   verdict?: Verdict;
@@ -80,6 +97,7 @@ export interface Verdict {
   finalJudgment: string;
   penaltyTasks: string[];
   tone: string;
+  disputeAnalyses?: DisputeAnalysis[]; // New: Analysis for each dispute point
 }
 
 export interface FactCheckResult {

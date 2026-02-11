@@ -1,19 +1,21 @@
-
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Scale, 
   User, 
   Loader2, 
-  Gavel, 
+  Swords, 
   AlertOctagon, 
   BookOpen,
-  Info
+  Info,
+  PenTool,
+  RefreshCw
 } from 'lucide-react';
 import { 
   CaseData, 
   CaseStatus, 
   UserRole 
 } from './types';
+import * as GeminiService from './services/geminiService';
 import { VoiceTextarea, EvidenceList, ThreeQualitiesInfo } from './components/Shared';
 
 interface VerdictSectionProps {
@@ -26,7 +28,26 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   // Local state for edits
   const [plRebuttal, setPlRebuttal] = useState(data.plaintiffRebuttal);
   const [defRebuttal, setDefRebuttal] = useState(data.defendantRebuttal || "");
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  // Update local state when data changes from polling (to keep inputs in sync if edited elsewhere, 
+  // but be careful not to overwrite user typing if they are ahead. 
+  // Actually, for simplicity in this demo, we can just rely on local state initialization.
+  // However, since parent polls every 2s, we should probably sync if the incoming data is different 
+  // AND we are not currently editing? 
+  // Standard React pattern for controlled inputs with external updates is tricky.
+  // Given the VoiceTextarea handles its own state for the text input, we should pass `value` and `onChange`.
+  // The polling will update `data`. If we just pass `data.plaintiffRebuttal` to `value`, 
+  // the cursor might jump if we rely solely on props.
+  // But here `VoiceTextarea` is controlled by `value` prop.
+  // We use `plRebuttal` state to ensure smooth typing.
+  // We should sync `plRebuttal` if `data.plaintiffRebuttal` changes significantly (e.g. from another user),
+  // but since this is mostly single-user or separate-tab simulation, let's keep it simple.
+  // The main issue was component remounting.
+  
+  // Loading state
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
   
   // Handlers for "Save Draft / Update State"
   const handleUpdate = (patch: Partial<CaseData>) => {
@@ -35,6 +56,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
 
   const isPlaintiff = role === UserRole.PLAINTIFF;
   const isDefendant = role === UserRole.DEFENDANT;
+  const isSpectator = role === UserRole.SPECTATOR;
 
   // Toggle contest logic
   const togglePlaintiffEvidenceContest = (id: string) => {
@@ -48,18 +70,46 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   };
 
   const handleFinishCrossExam = async () => {
-    setIsSubmitting(true);
-    // Proceed directly to Adjudication, skipping Debate phase
-    onSubmit({ 
-        status: CaseStatus.ADJUDICATING,
-    });
-    setIsSubmitting(false);
+    setIsAnalyzing(true);
+    setProgress(0);
+    setErrorMsg(""); // Clear previous errors
+
+    const timer = setInterval(() => {
+      setProgress(old => {
+        if (old >= 99) return 99; 
+        return old + 0.333; 
+      });
+    }, 100);
+
+    try {
+        const points = await GeminiService.analyzeDisputeFocus(
+            data.category,
+            data.description,
+            data.defenseStatement,
+            data.plaintiffRebuttal,
+            data.defendantRebuttal || ""
+        );
+        
+        clearInterval(timer);
+        setProgress(100);
+
+        setTimeout(() => {
+            onSubmit({ 
+                status: CaseStatus.DEBATE,
+                disputePoints: points
+            });
+        }, 800);
+
+    } catch (e) {
+        clearInterval(timer);
+        console.error(e);
+        setErrorMsg("AI 分析遇到问题，请检查网络后重试。");
+    }
   };
 
-  // --- Render Helpers for Strict Isolation ---
+  // --- Render Helpers (Moved inline or checks to avoid nesting components) ---
 
-  // 1. Context Card: What are we arguing against?
-  const OpposingStatementCard = () => {
+  const renderOpposingStatement = () => {
     if (isPlaintiff) {
         return (
             <div className="bg-white p-6 rounded-xl border-l-4 border-indigo-400 shadow-sm relative overflow-hidden">
@@ -82,11 +132,10 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
             </div>
         );
     }
-    return null; // Spectators see full view handled separately if needed, or default logic
+    return null; 
   };
 
-  // 2. Action Card: Evidence Contest & Rebuttal Input
-  const MyRebuttalSection = () => {
+  const renderMyRebuttal = () => {
     if (isPlaintiff) {
         return (
           <div className="bg-rose-50/50 p-5 rounded-2xl border-2 border-rose-100">
@@ -149,10 +198,74 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
         );
     }
     
-    // Spectator View (Simplified)
     return <div className="p-4 text-center text-slate-500 italic">观众模式：等待双方质证...</div>;
   };
 
+  // --- Loading Screen (Full View) ---
+  if (isAnalyzing) {
+    return (
+        <div className="min-h-[60vh] flex flex-col items-center justify-center p-8 animate-fade-in text-center">
+            {/* Animation Scene: Book & Pen */}
+            <div className="relative w-32 h-32 mb-8 mx-auto">
+                <BookOpen size={100} className="text-slate-200 mx-auto" strokeWidth={1.5} />
+                <div className={`absolute -top-4 -right-4 origin-bottom-left ${errorMsg ? '' : 'animate-writing'}`}>
+                    <PenTool size={48} className={`fill-rose-100 drop-shadow-lg ${errorMsg ? 'text-slate-400' : 'text-rose-600'}`} />
+                </div>
+                <style>{`
+                  @keyframes writing {
+                    0% { transform: translate(0, 0) rotate(0deg); }
+                    25% { transform: translate(-10px, 15px) rotate(-10deg); }
+                    50% { transform: translate(-25px, 5px) rotate(-5deg); }
+                    75% { transform: translate(-10px, 15px) rotate(-10deg); }
+                    100% { transform: translate(0, 0) rotate(0deg); }
+                  }
+                  .animate-writing {
+                    animation: writing 2s ease-in-out infinite;
+                  }
+                `}</style>
+            </div>
+
+            <h3 className="text-2xl font-bold text-slate-800 font-cute mb-3 animate-pulse">
+                {errorMsg ? "分析中断" : "法官正在努力总结案件争议焦点中..."}
+            </h3>
+            
+            <p className="text-slate-500 text-sm mb-6 max-w-xs mx-auto">
+                {errorMsg ? "请点击下方按钮重试" : "AI 法官正在仔细阅读双方的陈述与证据，耗时大概 30 秒，请耐心等待..."}
+            </p>
+
+            <div className="w-full max-w-xs bg-slate-100 h-5 rounded-full overflow-hidden shadow-inner border border-slate-200 relative mb-2">
+                <div 
+                    className={`h-full rounded-full transition-all ease-linear relative overflow-hidden ${errorMsg ? 'bg-slate-300' : 'bg-gradient-to-r from-rose-400 to-rose-600'}`}
+                    style={{ width: `${progress}%` }}
+                >
+                     {!errorMsg && <div className="absolute inset-0 bg-white/30 animate-pulse w-full h-full"></div>}
+                </div>
+            </div>
+            
+            <div className="flex justify-center w-full max-w-xs text-xs text-slate-400 font-bold px-1">
+                <span className={errorMsg ? 'text-slate-500' : 'text-rose-500'}>{Math.floor(progress)}%</span>
+            </div>
+
+            {!errorMsg && progress >= 99 && (
+                 <p className="mt-4 text-xs text-amber-600 bg-amber-50 px-3 py-1 rounded-full animate-bounce">
+                    案件比较复杂，法官还在思考中，请稍候...
+                 </p>
+            )}
+
+            {errorMsg && (
+                <button 
+                  onClick={handleFinishCrossExam}
+                  className="mt-6 bg-slate-800 text-white px-6 py-2 rounded-full font-bold hover:bg-black transition-colors"
+                >
+                  <RefreshCw size={16} className="inline mr-2" />
+                  重试
+                </button>
+            )}
+        </div>
+    );
+  }
+
+  // --- Normal Render ---
   return (
     <div className="space-y-6">
       {/* 0. Instruction Header */}
@@ -163,7 +276,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
 
       {/* 1. Review Phase: Context */}
       <div className="space-y-4">
-         <OpposingStatementCard />
+         {renderOpposingStatement()}
       </div>
 
       {/* 2. Action Phase: Input */}
@@ -171,7 +284,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
         <h2 className="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2 font-cute">
           <Scale className="text-slate-600" /> 质证环节
         </h2>
-        <MyRebuttalSection />
+        {renderMyRebuttal()}
       </div>
 
       {/* 3. Educational Tooltip (Three Qualities) */}
@@ -183,16 +296,12 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
       {/* 4. Next Step Warning */}
       <div className="bg-yellow-50 border border-yellow-200 p-4 rounded-xl text-sm text-yellow-800 flex gap-2 items-start shadow-sm">
          <AlertOctagon className="shrink-0 mt-0.5" size={18}/>
-         <p>质证结束后，将提交给 AI 法官进行最终裁决。</p>
+         <p>下一步将由 AI 总结核心争议焦点，双方可针对焦点进行最后一轮辩论。</p>
       </div>
 
       {/* 5. Submit Button */}
-      <button onClick={handleFinishCrossExam} disabled={isSubmitting} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl hover:bg-black shadow-lg flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform">
-        {isSubmitting ? (
-            <><Loader2 className="animate-spin" size={20}/> 正在提交审理...</>
-        ) : (
-            <><Gavel size={20}/> 结束质证，提交判决</>
-        )}
+      <button onClick={handleFinishCrossExam} disabled={isAnalyzing} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl hover:bg-black shadow-lg flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform">
+        <Swords size={20}/> 结束质证，进入争议焦点辩论
       </button>
     </div>
   );

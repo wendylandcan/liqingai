@@ -1,7 +1,6 @@
-
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from "openai";
-import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, EvidenceType } from "../types";
+import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, DisputePoint, EvidenceType } from "../types";
 
 // --- Environment Configuration ---
 
@@ -217,8 +216,8 @@ export const transcribeAudio = async (base64Audio: string, mimeType: string): Pr
           YOUR MANDATE:
           1. Transcribe the audio exactly but intelligently.
           2. FILTER OUT: All filler words (uh, um, like, you know, sort of), stutters, and hesitations.
-          3. FIX: Minor grammatical errors and sentence fragments to ensure logical flow.
-          4. OUTPUT: Return ONLY the clean, coherent text. No introductory phrases.`
+          3. PUNCTUATION: You MUST add proper punctuation (commas, periods, question marks) to make the transcript readable.
+          4. OUTPUT: Return ONLY the clean, coherent text with punctuation. No introductory phrases.`
         },
         contents: {
           parts: [
@@ -312,6 +311,36 @@ export const polishText = async (text: string): Promise<string> => {
 };
 
 /**
+ * Fixes grammar and removes filler words for speech input.
+ * Use simple model for speed.
+ */
+export const fixGrammar = async (text: string): Promise<string> => {
+  if (!text || text.length < 2) return text;
+  try {
+    const result = await smartGenerate({
+      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash for speed
+      systemInstruction: `You are a text cleaner and proofreader for a voice-input tool.
+      
+      TASK: Clean up the spoken text provided by the user.
+      
+      RULES:
+      1. PUNCTUATION (CRITICAL): The input text is raw speech-to-text without punctuation. You MUST insert proper punctuation (commas, periods, question marks) to make it a fluent, readable paragraph.
+      2. REMOVE FILLER WORDS: Delete spoken fillers like "uh", "um", "ah", "那个", "就是", "然后" (when used as filler), "呃", "啊".
+      3. FIX FLUENCY: Repair sentence fragments, stuttering, or repeated words.
+      4. PRESERVE MEANING: Do NOT change the original meaning.
+      5. PRESERVE EMOTION: Do NOT tone down anger or happiness. Keep the original tone.
+      
+      OUTPUT: Return ONLY the cleaned, punctuated text.`,
+      prompt: `Spoken Text: "${text}"`
+    });
+    return result.trim() || text;
+  } catch (error) {
+    console.error("Grammar Fix Error", error);
+    return text;
+  }
+};
+
+/**
  * Analyzes text for extreme emotions.
  * Logic: DeepSeek -> Gemini Flash Fallback (Default)
  */
@@ -355,6 +384,57 @@ export const extractFactPoints = async (narrative: string): Promise<FactCheckRes
 };
 
 /**
+ * Identifies core dispute points.
+ * Logic: Switch to Gemini 1.5 Flash (Simple Task)
+ */
+export const analyzeDisputeFocus = async (
+  category: string,
+  plaintiffDesc: string,
+  defenseDesc: string,
+  plaintiffRebuttal: string,
+  defendantRebuttal: string,
+): Promise<DisputePoint[]> => {
+  try {
+    const result = await smartGenerate({
+      model: GEMINI_MODEL_SIMPLE, // Use Gemini 1.5 Flash
+      jsonMode: true,
+      systemInstruction: `You are an AI Judge's Assistant specializing in conflict resolution.
+        
+        TASK: Analyze the "He said, She said" history and identify 1-3 CORE DISPUTE POINTS.
+        
+        REQUIREMENTS:
+        1. **Strict Terminology**: ALWAYS refer to the parties as "原告" (Plaintiff) and "被告" (Defendant). NEVER use "男方" (Male side), "女方" (Female side), "老公", "老婆", "男朋友", or "女朋友".
+        2. **Simple & Plain Language**: Use very simple, colloquial, easy-to-understand Chinese (通俗易懂). Avoid complex legal jargon.
+        3. **Concise**: Keep descriptions short and straight to the point (简明扼要).
+        4. **Focus**: Identify the underlying disagreement (e.g., "关于钱怎么花的矛盾" instead of "Financial Allocation Dispute").
+        
+        OUTPUT: JSON format with key "points" containing an array of objects (title, description).`,
+      prompt: `Category: ${category}
+      Plaintiff: ${plaintiffDesc}
+      Defendant: ${defenseDesc}
+      Plaintiff Rebuttal: ${plaintiffRebuttal}
+      Defendant Rebuttal: ${defendantRebuttal}`
+    });
+
+    const parsed = JSON.parse(result);
+    const points = parsed.points || [];
+    
+    return points.map((p: any, index: number) => ({
+        ...p,
+        id: p.id ? String(p.id) : `focus-${index}-${Date.now()}`
+    })) as DisputePoint[];
+
+  } catch (error) {
+    console.error("Dispute Analysis Error", error);
+    return [{
+      id: "default-1",
+      title: "核心矛盾",
+      description: "关于双方对于事件认知和责任认定的根本分歧。"
+    }];
+  }
+};
+
+/**
  * Generates the final verdict.
  * Logic: DeepSeek -> Gemini Flash Fallback (Complex Task / Pro)
  * SKILL: Persona-Based Adjudication & Intimate Relationship Expert
@@ -370,6 +450,7 @@ export const generateVerdict = async (
   plaintiffRebuttalEvidence: EvidenceItem[],
   defendantRebuttal: string,
   defendantRebuttalEvidence: EvidenceItem[],
+  disputePoints: DisputePoint[],
   persona: JudgePersona
 ): Promise<Verdict> => {
   
@@ -387,8 +468,8 @@ export const generateVerdict = async (
   }
 
   // Check for Default Judgment Scenario
-  // If defenseDesc indicates absence
-  const isDefaultJudgment = defenseDesc.includes("被告缺席");
+  // If disputePoints is empty or defenseDesc indicates absence
+  const isDefaultJudgment = defenseDesc.includes("被告缺席") || disputePoints.length === 0;
 
   if (isDefaultJudgment) {
     systemInstruction += `
@@ -397,6 +478,7 @@ export const generateVerdict = async (
     1. The defendant has waived their right to defend.
     2. You must evaluate the case based PRIMARILY on whether the Plaintiff's claims are logical and supported by their evidence.
     3. You do not need to find a "middle ground". If the plaintiff makes sense, rule in their favor (e.g., 100/0 or 90/10).
+    4. "disputeAnalyses" should focus on the validity of the Plaintiff's key demands since there is no counter-argument.
     `;
   }
 
@@ -410,16 +492,28 @@ export const generateVerdict = async (
   CORE RESPONSIBILITIES (Relationship Expert Mode):
   1. **Final Judgment (finalJudgment)**: 
      - You MUST explicitly address the Plaintiff's DEMANDS ("${plaintiffDemands}").
-     - Analyze the evidence and rebuttals to explain WHY you are granting, denying, or modifying these demands.
+     - Combine the "Dispute Points" analysis to explain WHY you are granting, denying, or modifying these demands.
      - Provide closure.
 
   2. **Compensation/Penalty Tasks (penaltyTasks)**:
-     - DO NOT act like a criminal court (no jail, no harsh fines unless agreed).
-     - ACT like a Relationship Therapist/Expert.
-     - DESIGN tasks that are:
-       a) **Restorative**: Heals the emotional bond.
-       b) **Preventive**: Creates a mechanism to avoid this specific conflict in the future (e.g., "Draft a budget protocol", "Set a 'safe word' for arguments").
-       c) **Human-Centric**: "Cook a meal", "Write a letter", "3-minute hug".
+     - **IDENTITY**: You are not just a Judge, but a **Top-tier Intimacy Coach (亲密关系经营专家)**.
+     - **PHILOSOPHY**: "Punishment" is just a disguised opportunity for connection.
+     - **REQUIREMENTS**:
+       a) **Fun & Creative**: Avoid boring chores. Use gamification (e.g., "Roleplay", "Love Coupons", "Truth or Dare").
+       b) **Case-Specific**: If the dispute is about housework, the task shouldn't just be "do housework", it should be "Do housework while the other person feeds them fruit".
+       c) **Feasible**: Tasks must be doable within a week.
+       d) **Connection-Focused (Restorative)**: Must involve eye contact, physical touch (hug/massage), or deep listening.
+     - **EXAMPLES (GOOD)**:
+       - "Lose side must give a 15-min full back massage while listening to the Winner's favorite playlist."
+       - "Winner picks a movie, Loser prepares snacks and stays off phone for the whole movie."
+       - "Write 3 things you appreciate about the partner on sticky notes and hide them around the house."
+       - "Re-enact the argument using only animal noises (Meow/Woof) to break the tension."
+     - **EXAMPLES (BAD)**:
+       - "Pay 500 RMB." (Too transactional)
+       - "Do all dishes for a month." (Breeds resentment, too long)
+
+  3. **Dispute Analysis (disputeAnalyses)**:
+     - For each core dispute point, provide a final ruling/insight based on the debate arguments.
   
   OUTPUT REQUIREMENT:
   You must output valid JSON.
@@ -427,6 +521,7 @@ export const generateVerdict = async (
   - summary (string)
   - facts (array of strings)
   - responsibilitySplit (object {plaintiff: number, defendant: number} - must sum to 100)
+  - disputeAnalyses (array of objects {title: string, analysis: string})
   - reasoning (string)
   - finalJudgment (string - Address the demands!)
   - penaltyTasks (array of strings - Creative & Preventive)
@@ -461,6 +556,16 @@ export const generateVerdict = async (
   const formatEvidence = (items: EvidenceItem[]) => 
     items.map(e => `[${e.type === 'TEXT' ? '文字' : '图片'}] ${e.description || '无描述'} (Contested: ${e.isContested ? 'Yes' : 'No'})`).join('\n') || "None";
 
+  const formatDebate = (points: DisputePoint[]) => {
+      if (!points || points.length === 0) return "None (Default Judgment / No Debate)";
+      return points.map(p => `
+        [Dispute Point]: ${p.title}
+        [Description]: ${p.description}
+        [Plaintiff's Final Argument]: ${p.plaintiffArg || "Waived"}
+        [Defendant's Final Argument]: ${p.defendantArg || "Waived"}
+      `).join('\n');
+  };
+
   const caseDetails = `
     CASE FILE:
     Category: ${category}
@@ -476,6 +581,9 @@ export const generateVerdict = async (
     Defendant Evidence: ${formatEvidence(defendantEvidence)}
     Plaintiff Rebuttal: "${plaintiffRebuttal}"
     Defendant Rebuttal: "${defendantRebuttal}"
+
+    --- PHASE 3: FINAL DEBATE ON CORE DISPUTES ---
+    ${formatDebate(disputePoints)}
   `;
 
   try {
@@ -497,7 +605,8 @@ export const generateVerdict = async (
         reasoning: "连接 AI 服务时出错，请检查 API Key 或网络（可能由于服务过载）。",
         finalJudgment: "抱歉，本法官暂时掉线了，请稍后再试。",
         penaltyTasks: [],
-        tone: "系统错误"
+        tone: "系统错误",
+        disputeAnalyses: []
     };
   }
 };

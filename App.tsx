@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { 
   Gavel, 
@@ -14,13 +13,17 @@ import {
   Copy, 
   Users, 
   Trash2, 
+  AlertOctagon, 
   Sparkles, 
   Home, 
   Heart, 
   Dog, 
   Cat, 
   PawPrint, 
-  UserX
+  Swords, 
+  MessageSquare, 
+  UserX,
+  GraduationCap
 } from 'lucide-react';
 import { 
   CaseData, 
@@ -30,7 +33,7 @@ import {
   JudgePersona 
 } from './types';
 import * as GeminiService from './services/geminiService';
-import { CaseService } from './services/mockDb';
+import { MockDb } from './services/mockDb';
 import { VerdictSection } from './VerdictSection';
 import { 
   ConfirmDialog, 
@@ -43,33 +46,51 @@ import Auth from './components/Auth';
 
 // --- Logic Steps (Wrapped components) ---
 
-const FilingForm = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => void }) => {
+const FilingForm = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => Promise<void> | void }) => {
   const [desc, setDesc] = useState(data.description);
   const [demands, setDemands] = useState(data.demands);
-  const [isChecking, setIsChecking] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!desc.trim()) return alert("请填写陈述");
-    setIsChecking(true);
     
-    // Parallel execution: Check sentiment, generate title AND generate summary
-    const [sentiment, title, summary] = await Promise.all([
+    setIsSubmitting(true);
+
+    // 1. Wait ONLY for Data Save to Supabase (Blocking Navigation)
+    // Once this awaits successfully, the parent will receive the status update.
+    // The UI will likely re-render and unmount this component shortly after.
+    await onSubmit({ 
+      description: desc, 
+      demands,
+      status: CaseStatus.PLAINTIFF_EVIDENCE 
+    });
+
+    // 2. Background AI Processing (Non-Blocking)
+    // We do NOT await this. It runs in the background.
+    // Even if this component unmounts, the Promise chain usually completes in JS environment.
+    // Ideally we'd use a global store or context to ensure it persists, but this works for this architecture.
+    Promise.all([
       GeminiService.analyzeSentiment(desc),
       GeminiService.generateCaseTitle(desc),
       GeminiService.summarizeStatement(desc, "Plaintiff")
-    ]);
-
-    setIsChecking(false);
-    
-    if (sentiment.isToxic) return alert(`⚠️ 需要冷静！\n\n${sentiment.reason}`);
-    
-    onSubmit({ 
-      description: desc, 
-      demands,
-      title: title || undefined, // Save the AI generated title
-      plaintiffSummary: summary // Save the AI generated summary
+    ]).then(([sentiment, title, summary]) => {
+      if (sentiment.isToxic) {
+         console.warn("Toxic content detected:", sentiment.reason);
+      }
+      // Update the case with AI results. 
+      // CaseManager is still mounted, so this onSubmit (which refers to CaseManager.update) is safe to call.
+      onSubmit({
+        title: title || undefined,
+        plaintiffSummary: summary
+      });
+    }).catch(err => {
+      console.error("Background AI task failed:", err);
     });
+    
+    // We don't necessarily need to set isSubmitting(false) if we are unmounting,
+    // but good practice in case navigation fails or stays.
+    // setIsSubmitting(false); 
   };
 
   return (
@@ -77,15 +98,19 @@ const FilingForm = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<
       <h2 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2 font-cute"><FileText className="text-rose-500" />原告起诉</h2>
       <VoiceTextarea label="事实陈述" placeholder="请具体描述..." value={desc} onChange={setDesc} required />
       <VoiceTextarea label="诉请" placeholder="诉请 (如: 道歉)..." value={demands} onChange={setDemands} required />
-      <button onClick={handleSubmit} disabled={isChecking} className="w-full bg-rose-600 text-white font-bold py-3 rounded-xl hover:bg-rose-700 disabled:opacity-50 flex items-center justify-center gap-2">
-        {isChecking ? <><Loader2 className="animate-spin" size={20}/> 正在进入举证环节...</> : '下一步：举证'}
+      <button 
+        onClick={handleSubmit} 
+        disabled={isSubmitting}
+        className="w-full bg-rose-600 text-white font-bold py-3 rounded-xl hover:bg-rose-700 flex items-center justify-center gap-2 shadow-md hover:shadow-lg transition-all active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed"
+      >
+        {isSubmitting ? <Loader2 className="animate-spin" /> : "下一步：举证"}
       </button>
     </div>
   );
 };
 
-const PlaintiffEvidenceStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => void }) => (
-  <div className="space-y-6">
+const PlaintiffEvidenceStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => Promise<void> | void }) => (
+  <div className="space-y-6 animate-fade-in">
     <div className="bg-white p-6 rounded-xl shadow-sm border border-rose-100">
       <h2 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2 font-cute"><Gavel className="text-rose-500" />原告举证</h2>
       <EvidenceList 
@@ -101,30 +126,29 @@ const PlaintiffEvidenceStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (
   </div>
 );
 
-const DefenseStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => void }) => {
+const DefenseStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => Promise<void> | void }) => {
   const [stmt, setStmt] = useState(data.defenseStatement);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Removed contesting logic as per requirement: only display statement summary without cross-examination
 
   const handleSubmit = async () => {
       if (!stmt.trim()) return alert("请填写答辩理由");
+      
       setIsSubmitting(true);
-      try {
-          // Generate summary for defense statement
-          const summary = await GeminiService.summarizeStatement(stmt, "Defendant");
-          onSubmit({ 
-              defenseStatement: stmt, 
-              defenseSummary: summary,
-              status: CaseStatus.CROSS_EXAMINATION 
-          });
-      } catch (e) {
-          // Fallback if summary fails
-          console.error("Summary generation failed", e);
-           onSubmit({ 
-              defenseStatement: stmt, 
-              status: CaseStatus.CROSS_EXAMINATION 
-          });
-      }
+
+      // 1. Wait ONLY for Data Save to Supabase (Blocking Navigation)
+      await onSubmit({ 
+          defenseStatement: stmt, 
+          status: CaseStatus.CROSS_EXAMINATION 
+      });
+
+      // 2. Background AI Processing (Non-Blocking)
+      GeminiService.summarizeStatement(stmt, "Defendant")
+        .then(summary => {
+           onSubmit({ defenseSummary: summary });
+        })
+        .catch(err => console.error("Background summary failed", err));
+        
+      // setIsSubmitting(false); // Component unmounts
   };
 
   return (
@@ -147,30 +171,128 @@ const DefenseStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial
           <div className="mt-2"><EvidenceCreator userRole={UserRole.DEFENDANT} onAdd={e => onSubmit({ defendantEvidence: [...data.defendantEvidence, e] })} /></div>
         </div>
       </div>
-      <button onClick={handleSubmit} disabled={isSubmitting} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 shadow-lg flex items-center justify-center gap-2">
-         {isSubmitting ? <><Loader2 className="animate-spin" size={20} /> 正在生成摘要并提交...</> : '进入质证环节'}
+      <button 
+        onClick={handleSubmit} 
+        disabled={isSubmitting}
+        className="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 shadow-lg flex items-center justify-center gap-2 active:scale-[0.98] transition-all disabled:opacity-70 disabled:cursor-not-allowed"
+      >
+         {isSubmitting ? <Loader2 className="animate-spin" /> : "进入质证环节"}
       </button>
     </div>
   );
 };
 
-const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => void }) => {
+const DisputeDebateStep = ({ data, onSubmit, userRole }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => Promise<void> | void, userRole: UserRole }) => {
+    const isPlaintiff = userRole === UserRole.PLAINTIFF;
+    const isDefendant = userRole === UserRole.DEFENDANT;
+
+    const handleArgUpdate = (pointId: string, text: string) => {
+        const updatedPoints = data.disputePoints.map(p => {
+            if (p.id === pointId) {
+                return isPlaintiff ? { ...p, plaintiffArg: text } : { ...p, defendantArg: text };
+            }
+            return p;
+        });
+        onSubmit({ disputePoints: updatedPoints });
+    };
+
+    return (
+        <div className="space-y-6 animate-fade-in">
+            <div className="bg-purple-50 border border-purple-200 p-6 rounded-xl text-center">
+                <div className="inline-flex p-3 bg-white rounded-full mb-3 shadow-sm">
+                    <Swords className="text-purple-600" size={32} />
+                </div>
+                <h2 className="text-xl font-bold text-purple-900 mb-2 font-cute">核心争议焦点辩论</h2>
+                <p className="text-purple-700 text-sm">AI 已基于双方陈述提炼出以下核心矛盾。请针对每个焦点进行最后的陈述。</p>
+            </div>
+
+            <div className="space-y-6">
+                {data.disputePoints.map((point, index) => (
+                    <div key={point.id} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                        <div className="flex items-center gap-3 mb-4 border-b border-slate-100 pb-3">
+                            <span className="bg-slate-800 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0">
+                                {index + 1}
+                            </span>
+                            <div>
+                                <h3 className="font-bold text-slate-800 text-lg">{point.title}</h3>
+                                <p className="text-slate-500 text-sm">{point.description}</p>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 gap-6">
+                            {/* Plaintiff Side */}
+                            <div className={`p-4 rounded-lg border-l-4 ${isPlaintiff ? 'bg-rose-50 border-rose-500' : 'bg-slate-50 border-slate-300'}`}>
+                                <div className="flex items-center gap-2 mb-2 font-bold text-rose-700 text-sm">
+                                    <User size={14} /> 原告观点
+                                    {!isPlaintiff && !point.plaintiffArg && <span className="text-slate-400 font-normal ml-auto text-xs">等待输入...</span>}
+                                </div>
+                                {isPlaintiff ? (
+                                    <VoiceTextarea 
+                                        label=""
+                                        placeholder="针对此争议点，你的最终陈述..."
+                                        value={point.plaintiffArg || ""}
+                                        onChange={(val) => handleArgUpdate(point.id, val)}
+                                    />
+                                ) : (
+                                    <p className="text-sm text-slate-700 italic">{point.plaintiffArg || "暂无陈述"}</p>
+                                )}
+                            </div>
+
+                            {/* Defendant Side */}
+                            <div className={`p-4 rounded-lg border-l-4 ${isDefendant ? 'bg-indigo-50 border-indigo-500' : 'bg-slate-50 border-slate-300'}`}>
+                                <div className="flex items-center gap-2 mb-2 font-bold text-indigo-700 text-sm">
+                                    <User size={14} /> 被告观点
+                                    {!isDefendant && !point.defendantArg && <span className="text-slate-400 font-normal ml-auto text-xs">等待输入...</span>}
+                                </div>
+                                {isDefendant ? (
+                                    <VoiceTextarea 
+                                        label=""
+                                        placeholder="针对此争议点，你的最终陈述..."
+                                        value={point.defendantArg || ""}
+                                        onChange={(val) => handleArgUpdate(point.id, val)}
+                                    />
+                                ) : (
+                                    <p className="text-sm text-slate-700 italic">{point.defendantArg || "暂无陈述"}</p>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            <div className="bg-yellow-50 border border-yellow-200 p-4 rounded-xl text-sm text-yellow-800 flex gap-2 items-start">
+                <AlertOctagon className="shrink-0 mt-0.5" size={18}/>
+                <p>辩论结束后，将直接提交给 AI 法官进行最终裁决。请确保已充分表达。</p>
+            </div>
+
+            <button onClick={() => onSubmit({ status: CaseStatus.ADJUDICATING })} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl hover:bg-black shadow-lg flex items-center justify-center gap-2">
+                <Gavel size={20}/> 辩论结束，申请判决 (Proceed to Verdict)
+            </button>
+        </div>
+    );
+};
+
+const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Partial<CaseData>) => Promise<void> | void }) => {
   const [persona, setPersona] = useState(data.judgePersona);
   const [isDeliberating, setIsDeliberating] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const handleJudgement = async () => {
     setIsDeliberating(true);
+    // Start progress animation
+    setTimeout(() => setProgress(100), 100);
+
     try {
       const verdict = await GeminiService.generateVerdict(
         data.category, data.description, data.demands, data.defenseStatement,
         data.evidence, data.defendantEvidence, 
         data.plaintiffRebuttal, data.plaintiffRebuttalEvidence, 
         data.defendantRebuttal || "", data.defendantRebuttalEvidence || [],
+        data.disputePoints || [],
         persona
       );
       onSubmit({ verdict, judgePersona: persona, status: CaseStatus.CLOSED });
-    } catch (e) { alert("AI 法官忙碌中"); } 
-    finally { setIsDeliberating(false); }
+    } catch (e) { alert("AI 法官忙碌中"); setIsDeliberating(false); setProgress(0); } 
   };
 
   const personas = [
@@ -187,6 +309,60 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
       icon: <Cat size={32} className="text-rose-600" />
     }
   ];
+
+  if (isDeliberating) {
+    const isCat = persona === JudgePersona.CAT;
+    return (
+       <div className="min-h-[60vh] flex flex-col items-center justify-center p-8 space-y-10 animate-fade-in">
+          {/* Animated Scene: Reading */}
+          <div className="relative flex flex-col items-center justify-center mt-12 mb-12">
+             {/* The Judge (Head moving slightly left to right to simulate reading) */}
+             {/* Added Graduation Cap floating on head */}
+             <div className="relative z-10 transition-transform duration-1000 ease-in-out" style={{ animation: 'readingHead 2s ease-in-out infinite alternate' }}>
+                <div className="absolute -top-12 left-1/2 -translate-x-1/2 z-20 transform -rotate-6">
+                    <GraduationCap size={64} className="text-slate-900 fill-slate-800 drop-shadow-md" strokeWidth={1.5} />
+                </div>
+                {isCat ? (
+                   <Cat size={110} className="text-rose-500 drop-shadow-xl" strokeWidth={1.8} />
+                ) : (
+                   <Dog size={110} className="text-slate-800 drop-shadow-xl" strokeWidth={1.8} />
+                )}
+             </div>
+             
+             {/* Dynamic styles for keyframes since we can't easily add global css here without style tag */}
+             <style>{`
+               @keyframes readingHead {
+                 0% { transform: translateX(-5px) rotate(-2deg); }
+                 100% { transform: translateX(5px) rotate(2deg); }
+               }
+             `}</style>
+          </div>
+
+          <div className="text-center space-y-3 max-w-xs mx-auto">
+             <h3 className="text-2xl font-bold text-slate-800 font-cute animate-pulse">
+               AI 法官正在审理中...
+             </h3>
+             <p className="text-slate-500 font-medium">
+               （预计 1分钟）
+             </p>
+          </div>
+
+          {/* Progress Bar (60s duration) */}
+          <div className="w-full max-w-xs bg-slate-100 h-3 rounded-full overflow-hidden shadow-inner border border-slate-200">
+             <div 
+               className="h-full rounded-full transition-all ease-linear"
+               style={{ 
+                 width: `${progress}%`, 
+                 backgroundColor: isCat ? '#fb7185' : '#475569', 
+                 transitionDuration: '60000ms' // 60 seconds
+               }}
+             ></div>
+          </div>
+          
+          <p className="text-xs text-slate-400 italic">正在查阅案卷与证据...</p>
+       </div>
+    )
+  }
 
   return (
     <div className="p-4 space-y-6">
@@ -224,12 +400,8 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
         ))}
       </div>
 
-      <button onClick={handleJudgement} disabled={isDeliberating} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl shadow-xl flex justify-center items-center gap-2 mt-4 hover:scale-[1.01] transition-transform">
-        {isDeliberating ? (
-          <><Loader2 className="animate-spin" /> 正在审理中...</>
-        ) : (
-          <><Gavel size={20} /> 召唤 AI 判决</>
-        )}
+      <button onClick={handleJudgement} className="w-full bg-slate-900 text-white font-bold py-4 rounded-xl shadow-xl flex justify-center items-center gap-2 mt-4 hover:scale-[1.01] transition-transform">
+        <><Gavel size={20} /> 召唤 AI 判决</>
       </button>
     </div>
   );
@@ -314,6 +486,23 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
         </ul>
       </div>
 
+      {verdict.disputeAnalyses && verdict.disputeAnalyses.length > 0 && (
+        <div className="bg-white p-6 rounded-2xl shadow-sm border-2 border-slate-100 relative overflow-hidden">
+          <h3 className="text-xl text-slate-800 mb-4 flex items-center gap-2">
+             <Scale className={isCat ? "text-rose-500" : "text-slate-800"} />
+             争议焦点分析
+          </h3>
+          <div className="space-y-4 font-sans">
+            {verdict.disputeAnalyses.map((item, idx) => (
+              <div key={idx} className={`p-4 rounded-xl ${isCat ? 'bg-rose-50/50 border border-rose-100' : 'bg-slate-50 border border-slate-100'}`}>
+                 <h4 className={`font-bold mb-2 ${isCat ? 'text-rose-700' : 'text-slate-700'}`} style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>{item.title}</h4>
+                 <p className="text-slate-600 text-base leading-relaxed" style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>{item.analysis}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className={`${isCat ? 'bg-orange-50 border-orange-100' : 'bg-blue-50 border-blue-100'} p-6 rounded-2xl shadow-sm border-2 relative`}>
         <div className="absolute top-0 right-0 p-4 opacity-10">
             <Gavel size={80} className={isCat ? "text-orange-500" : "text-blue-500"} />
@@ -353,6 +542,7 @@ const getStatusText = (status: CaseStatus) => {
     case CaseStatus.PLAINTIFF_EVIDENCE: return "原告举证";
     case CaseStatus.DEFENSE_PENDING: return "等待应诉";
     case CaseStatus.CROSS_EXAMINATION: return "质证环节";
+    case CaseStatus.DEBATE: return "争议辩论";
     case CaseStatus.ADJUDICATING: return "AI审理中";
     case CaseStatus.CLOSED: return "已结案";
     case CaseStatus.CANCELLED: return "已撤诉";
@@ -364,60 +554,46 @@ const Dashboard = ({ user, onSelectCase, onLogout }: { user: string, onSelectCas
   const [cases, setCases] = useState<CaseData[]>([]);
   const [joinCode, setJoinCode] = useState("");
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
 
-  const refresh = async () => {
-    setLoading(true);
-    try {
-       const userCases = await CaseService.getCasesForUser(user);
-       setCases(userCases);
-    } catch (e) {
-       console.error(e);
-    } finally {
-       setLoading(false);
-    }
-  };
-  
+  const refresh = () => setCases(MockDb.getCasesForUser(user));
   useEffect(() => { refresh(); }, [user]);
 
   const handleCreate = async () => {
     setIsCreating(true);
     try {
-       const newCase = await CaseService.createCase(user);
-       if (newCase) {
-         onSelectCase(newCase.id);
-       } else {
-         alert("创建失败：未返回案件信息");
-       }
-    } catch (e: any) {
-       console.error("Create Case Failed", e);
-       alert(`创建案件失败，请检查网络\n\n错误信息: ${e.message || '未知错误'}`);
+      const newCase = await MockDb.createCase(user);
+      onSelectCase(newCase.id);
+    } catch (e) {
+      console.error(e);
+      alert("创建案件失败");
     } finally {
       setIsCreating(false);
     }
   };
 
-  const handleJoin = async () => {
-    const res = await CaseService.joinCase(joinCode.trim().toUpperCase(), user);
+  const handleJoin = () => {
+    const res = MockDb.joinCase(joinCode.trim().toUpperCase(), user);
     if (res.success && res.caseId) onSelectCase(res.caseId);
     else alert(res.error || "加入失败");
   };
 
   const requestDelete = (e: React.MouseEvent, caseId: string) => {
+    // Prevent event from bubbling up to the card click handler
     e.stopPropagation();
+    // Prevent default button behavior
     e.preventDefault();
     setDeleteTargetId(caseId);
   };
 
-  const confirmDelete = async () => {
+  const confirmDelete = () => {
     if (deleteTargetId) {
        try {
-        await CaseService.deleteCase(deleteTargetId);
-        refresh();
+        MockDb.deleteCase(deleteTargetId);
+        // Immediately refresh state
+        setCases(MockDb.getCasesForUser(user));
       } catch (err) {
         console.error("Delete failed", err);
-        alert("删除失败");
       }
       setDeleteTargetId(null);
     }
@@ -448,13 +624,9 @@ const Dashboard = ({ user, onSelectCase, onLogout }: { user: string, onSelectCas
         <div className="bg-white p-6 rounded-xl shadow-sm border border-rose-100 text-center">
           <h2 className="text-lg font-bold text-slate-800 mb-4 font-cute">欢迎, {user}</h2>
           <div className="grid grid-cols-2 gap-3">
-            <button 
-              onClick={handleCreate} 
-              disabled={isCreating}
-              className="bg-rose-600 text-white p-4 rounded-xl font-bold flex flex-col items-center gap-2 hover:bg-rose-700 transition-colors disabled:opacity-50 disabled:cursor-wait"
-            >
+            <button onClick={handleCreate} disabled={isCreating} className="bg-rose-600 text-white p-4 rounded-xl font-bold flex flex-col items-center gap-2 hover:bg-rose-700 disabled:opacity-50">
               {isCreating ? <Loader2 className="animate-spin" /> : <PlusCircle />} 
-              {isCreating ? "创建中..." : "发起起诉"}
+              发起起诉
             </button>
             <div className="bg-slate-100 p-4 rounded-xl flex flex-col gap-2">
               <input value={joinCode} onChange={e => setJoinCode(e.target.value)} placeholder="输入案件码" className="w-full text-center text-sm p-1 rounded bg-white border border-slate-200 uppercase" />
@@ -464,18 +636,16 @@ const Dashboard = ({ user, onSelectCase, onLogout }: { user: string, onSelectCas
         </div>
 
         <div>
-          <div className="flex justify-between items-center mb-3">
-             <h3 className="text-sm font-bold text-slate-500 uppercase">我的案件</h3>
-             <button onClick={refresh} className="text-slate-400 hover:text-rose-500"><RefreshCw size={16}/></button>
-          </div>
+          <h3 className="text-sm font-bold text-slate-500 uppercase mb-3">我的案件</h3>
           <div className="space-y-3">
-            {loading && <div className="text-center py-4"><Loader2 className="animate-spin text-rose-500 mx-auto"/></div>}
-            {!loading && cases.length === 0 && <p className="text-center text-slate-400 py-4 text-sm">暂无案件</p>}
-            {!loading && cases.map(c => (
+            {cases.length === 0 && <p className="text-center text-slate-400 py-4 text-sm">暂无案件</p>}
+            {cases.map(c => (
               <div key={c.id} onClick={() => c.status !== CaseStatus.CANCELLED && onSelectCase(c.id)} className={`bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex justify-between items-center ${c.status === CaseStatus.CANCELLED ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer hover:border-rose-300'}`}>
                 <div className="flex-1 min-w-0 mr-2">
+                  {/* Changed to prioritize title if available, otherwise description (truncated), otherwise category */}
                   <p className="font-bold text-slate-800 text-sm line-clamp-1">{c.title || c.description || c.category}</p>
                   <p className="text-xs text-slate-500">
+                    {/* If title exists, show category in subtitle. Else standard behavior */}
                     {c.title ? c.category + ' • ' : (c.description ? c.category + ' • ' : '')} 
                     {new Date(c.createdDate).toLocaleDateString()} • {getStatusText(c.status)}
                   </p>
@@ -516,45 +686,28 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showDefaultJudgmentConfirm, setShowDefaultJudgmentConfirm] = useState(false);
 
-  const load = async () => {
-    // Silent load for polling, explicit loading for initial
-    try {
-       const c = await CaseService.getCase(caseId);
-       setData(c);
-       setLoading(false);
-    } catch (e) {
-       console.error(e);
-    }
+  const load = () => {
+    const c = MockDb.getCase(caseId);
+    setData(c);
+    setLoading(false);
   };
 
-  useEffect(() => { 
-     load(); 
-     const int = setInterval(load, 3000); // Poll every 3s
-     return () => clearInterval(int); 
-  }, [caseId]);
+  useEffect(() => { load(); const int = setInterval(load, 2000); return () => clearInterval(int); }, [caseId]);
 
   const update = async (patch: Partial<CaseData>) => {
     if (!data) return;
-    try {
-       // Optimistic update
-       setData({ ...data, ...patch });
-       // DB update
-       const updated = await CaseService.updateCase(data.id, patch);
-       if (updated) setData(updated);
-    } catch (e) {
-       console.error("Update failed", e);
-       alert("保存失败，请检查网络");
-       load(); // Revert
-    }
+    // Update local state and sync with Supabase async
+    const updated = await MockDb.updateCase(data.id, patch);
+    setData(updated);
   };
 
   const handleDeleteClick = () => {
     setShowDeleteConfirm(true);
   };
 
-  const confirmDelete = async () => {
+  const confirmDelete = () => {
     if (data) {
-       await CaseService.deleteCase(data.id);
+       MockDb.deleteCase(data.id);
        onBack();
     }
   };
@@ -564,6 +717,7 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
       defenseStatement: "（被告缺席，放弃答辩）",
       defenseSummary: "被告未出庭应诉，视为放弃答辩权利。",
       status: CaseStatus.ADJUDICATING,
+      disputePoints: [] 
     });
     setShowDefaultJudgmentConfirm(false);
   };
@@ -581,31 +735,64 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
       return;
     }
 
-    if (isPlaintiff) {
-      if (data.status === CaseStatus.PLAINTIFF_EVIDENCE) {
-        update({ status: CaseStatus.DRAFTING });
+    // Phase 1: Drafting -> Can go back to Dashboard
+    if (data.status === CaseStatus.DRAFTING) {
+        onBack();
         return;
-      }
-      if (data.status === CaseStatus.DEFENSE_PENDING) {
-        // Plaintiff wants to go back and add more evidence while waiting
-        update({ status: CaseStatus.PLAINTIFF_EVIDENCE });
+    }
+
+    // Phase 2: Plaintiff Evidence -> Can go back to Drafting (Un-submit description?)
+    if (isPlaintiff && data.status === CaseStatus.PLAINTIFF_EVIDENCE) {
+      update({ status: CaseStatus.DRAFTING });
+      return;
+    }
+
+    // Phase 3: Defense Pending -> Plaintiff can go back to Evidence
+    // Allows Plaintiff to modify evidence if they clicked submit too early or want to change something while waiting.
+    if (data.status === CaseStatus.DEFENSE_PENDING) {
+        if (isPlaintiff) {
+            update({ status: CaseStatus.PLAINTIFF_EVIDENCE });
+            return;
+        }
+        onBack();
         return;
-      }
-    } 
-    
-    // For both parties, if in Cross-Examination, go back to Defense Pending
+    }
+
+    // Phase 4: Cross Examination -> Go back to Defense Pending
     if (data.status === CaseStatus.CROSS_EXAMINATION) {
-       update({ status: CaseStatus.DEFENSE_PENDING });
-       return;
+        update({ status: CaseStatus.DEFENSE_PENDING });
+        return;
     }
 
-    // New: If in Adjudicating (Judge Selection) step
+    // Phase 5: Debate -> Go back to Cross Examination
+    if (data.status === CaseStatus.DEBATE) {
+        update({ status: CaseStatus.CROSS_EXAMINATION });
+        return;
+    }
+
+    // Phase: ADJUDICATING -> Go back to previous step
     if (data.status === CaseStatus.ADJUDICATING) {
-       update({ status: CaseStatus.CROSS_EXAMINATION });
-       return;
+        // 1. If appealing (verdict exists), go back to Verdict View
+        if (data.verdict) {
+            update({ status: CaseStatus.CLOSED });
+            return;
+        }
+        
+        // 2. If Default Judgment (detected by specific text), go back to Defense Pending and reset
+        if (data.defenseStatement === "（被告缺席，放弃答辩）") {
+             update({ 
+                 status: CaseStatus.DEFENSE_PENDING,
+                 defenseStatement: "", 
+                 defenseSummary: undefined 
+             });
+             return;
+        }
+
+        // 3. Otherwise, go back to Debate
+        update({ status: CaseStatus.DEBATE });
+        return;
     }
 
-    // Default exit
     onBack();
   };
 
@@ -626,7 +813,7 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
   switch (data.status) {
     case CaseStatus.DRAFTING:
       title = "原告起诉";
-      content = isPlaintiff ? <FilingForm data={data} onSubmit={(d) => update({ ...d, status: CaseStatus.PLAINTIFF_EVIDENCE })} /> : <Waiting msg="等待原告填写起诉状..." />;
+      content = isPlaintiff ? <FilingForm data={data} onSubmit={update} /> : <Waiting msg="等待原告填写起诉状..." />;
       break;
     case CaseStatus.PLAINTIFF_EVIDENCE:
       title = "原告举证";
@@ -679,6 +866,10 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
       title = "质证环节";
       // Shared view for both parties
       content = <VerdictSection data={data} onSubmit={update} role={role} />;
+      break;
+    case CaseStatus.DEBATE: // New Debate Phase
+      title = "争议焦点辩论";
+      content = <DisputeDebateStep data={data} onSubmit={update} userRole={role} />;
       break;
     case CaseStatus.ADJUDICATING:
       title = "AI 审理中";

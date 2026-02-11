@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   Loader2, 
   Sparkles, 
@@ -9,7 +9,9 @@ import {
   X as XIcon,
   ImageIcon,
   FileAudio,
-  Music
+  Music,
+  StopCircle,
+  Wand2
 } from 'lucide-react';
 import * as GeminiService from '../services/geminiService';
 import { EvidenceItem, EvidenceType, UserRole } from '../types';
@@ -68,13 +70,7 @@ const processAudioFile = (file: File): Promise<{ base64: string, compressed: boo
     reader.readAsDataURL(file);
     reader.onload = (e) => {
       let result = e.target?.result as string;
-      // In a real app, we would compress here. For mock, we check if it fits in LocalStorage roughly.
-      // If > 2MB, we might need to truncate or warn (but we'll try to keep it for analysis).
-      // Since we rely on Gemini for analysis, we return the base64 for that.
-      // But for storage, we might return a placeholder if it's too big to avoid crashing the demo.
-      
       const isTooBigForStorage = result.length > 3 * 1024 * 1024; // ~3MB limit for safety in localStorage
-      
       resolve({
         base64: result,
         compressed: !isTooBigForStorage // Flag to indicate if we can store the file content
@@ -207,40 +203,152 @@ export const VoiceTextarea = ({
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isPolishing, setIsPolishing] = useState(false);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  
+  // References for MediaRecorder (Fallback)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  
+  // Reference for Web Speech API (Native)
+  const recognitionRef = useRef<any>(null);
+  const activeSessionTextRef = useRef<string>("");
+  // IMPORTANT: Keep track of latest value for onend callback
+  const valueRef = useRef(value);
+  useEffect(() => { valueRef.current = value; }, [value]);
 
-  const startRecording = async () => {
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch(e) {}
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+    };
+  }, []);
+
+  const startNativeRecording = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return false;
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'zh-CN';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        setIsRecording(true);
+        activeSessionTextRef.current = "";
+      };
+
+      // Handler for when recording stops (Manual or Auto)
+      recognition.onend = async () => {
+        setIsRecording(false);
+        // Auto-Fix Grammar / Punctuation if we had a meaningful session
+        if (activeSessionTextRef.current && activeSessionTextRef.current.length > 1) {
+             setIsOptimizing(true);
+             // Use the latest value from ref (which includes the just-spoken text)
+             const fixed = await GeminiService.fixGrammar(valueRef.current); 
+             onChange(fixed);
+             setIsOptimizing(false);
+             activeSessionTextRef.current = "";
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn("Speech recognition error", event.error);
+        setIsRecording(false);
+      };
+
+      // Real-time interim results logic
+      // We capture the text BEFORE recording started
+      let sessionBase = value; 
+
+      recognition.onresult = (event: any) => {
+        let currentSessionTranscript = '';
+        
+        // Reconstruct the full transcript of the current session (interim + final)
+        for (let i = 0; i < event.results.length; ++i) {
+          currentSessionTranscript += event.results[i][0].transcript;
+        }
+        
+        activeSessionTextRef.current = currentSessionTranscript;
+        // Update the parent with Base + Current Session
+        onChange(sessionBase + currentSessionTranscript);
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+      return true;
+    } catch (e) {
+      console.error("Native speech API failed", e);
+      return false;
+    }
+  };
+
+  const startFallbackRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaRecorderRef.current = new MediaRecorder(stream);
       chunksRef.current = [];
-      mediaRecorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mediaRecorderRef.current.ondataavailable = (e) => { 
+        if (e.data.size > 0) chunksRef.current.push(e.data); 
+      };
       mediaRecorderRef.current.start();
       setIsRecording(true);
-    } catch (err) { alert("麦克风权限错误"); }
+    } catch (err) { 
+        console.error(err);
+        alert("无法启动录音，请检查麦克风权限。"); 
+    }
   };
 
-  const stopRecording = async () => {
-    if (!mediaRecorderRef.current) return;
-    return new Promise<void>((resolve) => {
-      mediaRecorderRef.current!.onstop = async () => {
-        setIsRecording(false);
-        setIsTranscribing(true);
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.readAsDataURL(blob);
-        reader.onloadend = async () => {
-          const base64data = (reader.result as string).split(',')[1];
-          const text = await GeminiService.transcribeAudio(base64data, 'audio/webm');
-          onChange(value ? value + " " + text : text);
-          setIsTranscribing(false);
-          resolve();
+  const toggleRecording = async () => {
+    if (isRecording) {
+      // STOP
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+        recognitionRef.current = null;
+        // Logic handled in onend
+      } else if (mediaRecorderRef.current) {
+        // Stop fallback recorder
+        const mimeType = mediaRecorderRef.current.mimeType || 'audio/webm';
+        mediaRecorderRef.current.onstop = async () => {
+          setIsRecording(false);
+          setIsTranscribing(true);
+          
+          const blob = new Blob(chunksRef.current, { type: mimeType });
+          if (blob.size === 0) {
+              setIsTranscribing(false);
+              return;
+          }
+
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = async () => {
+            const result = reader.result as string;
+            const base64data = result.split(',')[1];
+            const detectedMime = result.match(/:(.*?);/)?.[1] || mimeType;
+
+            const text = await GeminiService.transcribeAudio(base64data, detectedMime);
+            onChange(value ? value + " " + text : text);
+            setIsTranscribing(false);
+          };
         };
-      };
-      mediaRecorderRef.current!.stop();
-      mediaRecorderRef.current!.stream.getTracks().forEach(track => track.stop());
-    });
+        mediaRecorderRef.current.stop();
+        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+        mediaRecorderRef.current = null;
+      }
+    } else {
+      // START
+      // Try native first
+      const startedNative = startNativeRecording();
+      if (!startedNative) {
+        // Fallback
+        startFallbackRecording();
+      }
+    }
   };
 
   const handlePolish = async () => {
@@ -255,17 +363,24 @@ export const VoiceTextarea = ({
     <div>
       <div className="flex justify-between items-center mb-1">
         <label className="text-sm font-medium text-slate-600">{label}</label>
-        {value.length > 5 && (
-          <button 
-            type="button" 
-            onClick={handlePolish} 
-            disabled={isPolishing}
-            className="flex items-center gap-1 text-xs font-bold text-violet-600 bg-violet-50 px-2 py-1 rounded-full hover:bg-violet-100 transition-colors animate-fade-in"
-          >
-            {isPolishing ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12} />}
-            {isPolishing ? "AI 润色中..." : "AI 润色 (Superpower)"}
-          </button>
-        )}
+        <div className="flex gap-2">
+            {isOptimizing && (
+               <span className="flex items-center gap-1 text-xs font-bold text-emerald-600 animate-pulse">
+                  <Wand2 size={12} /> 正在整理语句...
+               </span>
+            )}
+            {value.length > 5 && !isOptimizing && (
+            <button 
+                type="button" 
+                onClick={handlePolish} 
+                disabled={isPolishing}
+                className="flex items-center gap-1 text-xs font-bold text-violet-600 bg-violet-50 px-2 py-1 rounded-full hover:bg-violet-100 transition-colors animate-fade-in"
+            >
+                {isPolishing ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12} />}
+                {isPolishing ? "AI 润色中..." : "AI 润色 (去情绪)"}
+            </button>
+            )}
+        </div>
       </div>
       <div className="relative">
         <textarea 
@@ -277,17 +392,18 @@ export const VoiceTextarea = ({
         />
         <button
           type="button"
-          onClick={isRecording ? stopRecording : startRecording}
-          disabled={isTranscribing}
+          onClick={toggleRecording}
+          disabled={isTranscribing || isOptimizing}
           className={`absolute bottom-3 right-3 p-2 rounded-full transition-all flex items-center gap-2 shadow-sm ${
             isRecording 
               ? 'bg-red-500 text-white animate-pulse' 
-              : isTranscribing 
-                ? 'bg-slate-200 text-slate-500' 
+              : (isTranscribing || isOptimizing) 
+                ? 'bg-emerald-50 text-emerald-600 border border-emerald-200' 
                 : 'bg-rose-100 text-rose-600 hover:bg-rose-200'
           }`}
+          title={isRecording ? "点击停止" : "点击开始录音"}
         >
-          {isTranscribing ? <Loader2 size={16} className="animate-spin" /> : <Mic size={16} />}
+          {isTranscribing || isOptimizing ? <Loader2 size={16} className="animate-spin" /> : (isRecording ? <StopCircle size={16} /> : <Mic size={16} />)}
         </button>
       </div>
     </div>
@@ -407,43 +523,129 @@ export const EvidenceCreator = ({
   const [textInput, setTextInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [isCompressing, setIsCompressing] = useState(false);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  
+  // Audio Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const recognitionRef = useRef<any>(null);
+  const activeSessionTextRef = useRef<string>("");
+  
+  // Ref for latest text input for onend
+  const textInputRef = useRef(textInput);
+  useEffect(() => { textInputRef.current = textInput; }, [textInput]);
+  
   const [isRecording, setIsRecording] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
 
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorderRef.current = new MediaRecorder(stream);
-      chunksRef.current = [];
-      mediaRecorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mediaRecorderRef.current.start();
-      setIsRecording(true);
-    } catch (err) { alert("麦克风权限错误"); }
-  };
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch(e) {}
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+    };
+  }, []);
 
-  const stopRecording = async () => {
-    if (!mediaRecorderRef.current) return;
-    return new Promise<void>((resolve) => {
-      mediaRecorderRef.current!.onstop = async () => {
-        setIsRecording(false);
-        setIsProcessing(true);
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.readAsDataURL(blob);
-        reader.onloadend = async () => {
-          const base64data = (reader.result as string).split(',')[1];
-          const text = await GeminiService.transcribeAudio(base64data, 'audio/webm');
-          setTextInput(prev => prev + " " + text);
-          setIsProcessing(false);
-          resolve();
+  const toggleRecording = async () => {
+    if (isRecording) {
+      // STOP
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+        recognitionRef.current = null;
+        // Logic in onend
+      } else if (mediaRecorderRef.current) {
+        // Stop Fallback
+        const mimeType = mediaRecorderRef.current.mimeType || 'audio/webm';
+        mediaRecorderRef.current.onstop = async () => {
+            setIsRecording(false);
+            setIsProcessing(true);
+            const blob = new Blob(chunksRef.current, { type: mimeType });
+            if (blob.size === 0) { setIsProcessing(false); return; }
+
+            const reader = new FileReader();
+            reader.readAsDataURL(blob);
+            reader.onloadend = async () => {
+                const result = reader.result as string;
+                const base64data = result.split(',')[1];
+                const detectedMime = result.match(/:(.*?);/)?.[1] || mimeType;
+
+                const text = await GeminiService.transcribeAudio(base64data, detectedMime);
+                setTextInput(prev => prev ? prev + " " + text : text);
+                setIsProcessing(false);
+            };
         };
-      };
-      mediaRecorderRef.current!.stop();
-      mediaRecorderRef.current!.stream.getTracks().forEach(track => track.stop());
-    });
+        mediaRecorderRef.current.stop();
+        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+        mediaRecorderRef.current = null;
+      }
+    } else {
+      // START
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      
+      // Native Path
+      if (SpeechRecognition) {
+         try {
+             const recognition = new SpeechRecognition();
+             recognition.lang = 'zh-CN';
+             recognition.continuous = true;
+             recognition.interimResults = true;
+             
+             recognition.onstart = () => {
+               setIsRecording(true);
+               activeSessionTextRef.current = "";
+             };
+             
+             recognition.onend = async () => {
+                setIsRecording(false);
+                // Auto-fix if we had a session
+                if (activeSessionTextRef.current && activeSessionTextRef.current.length > 1) {
+                     setIsOptimizing(true);
+                     const fixed = await GeminiService.fixGrammar(textInputRef.current); 
+                     setTextInput(fixed);
+                     setIsOptimizing(false);
+                     activeSessionTextRef.current = "";
+                }
+             };
+
+             recognition.onerror = () => setIsRecording(false);
+             
+             let sessionBase = textInput;
+             recognition.onresult = (e: any) => {
+                 let currentSessionTranscript = '';
+                 for (let i = 0; i < e.results.length; ++i) {
+                    currentSessionTranscript += e.results[i][0].transcript;
+                 }
+                 activeSessionTextRef.current = currentSessionTranscript;
+                 setTextInput(sessionBase + currentSessionTranscript);
+             };
+             
+             recognitionRef.current = recognition;
+             recognition.start();
+             return;
+         } catch(e) {
+             console.error("Native error", e);
+         }
+      }
+
+      // Fallback Path
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          mediaRecorderRef.current = new MediaRecorder(stream);
+          chunksRef.current = [];
+          mediaRecorderRef.current.ondataavailable = (e) => { 
+            if (e.data.size > 0) chunksRef.current.push(e.data); 
+          };
+          mediaRecorderRef.current.start();
+          setIsRecording(true);
+      }).catch(err => {
+          console.error(err);
+          alert("无法启动录音");
+      });
+    }
   };
 
   const handleAddText = () => {
@@ -545,12 +747,21 @@ export const EvidenceCreator = ({
            placeholder="输入文字或证据描述..."
         />
         <button
-          onClick={isRecording ? stopRecording : startRecording}
-          className={`absolute bottom-2 right-2 p-2 rounded-full ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-slate-200 text-slate-600'}`}
+          onClick={toggleRecording}
+          disabled={isOptimizing || isProcessing}
+          className={`absolute bottom-2 right-2 p-2 rounded-full ${
+              isRecording 
+              ? 'bg-red-500 text-white animate-pulse' 
+              : (isOptimizing || isProcessing) 
+                  ? 'bg-emerald-50 text-emerald-600 border border-emerald-200' 
+                  : 'bg-slate-200 text-slate-600'
+          }`}
+          title={isRecording ? "点击停止" : "点击开始录音 (优先使用原生语音识别)"}
         >
-          {isProcessing ? <Loader2 size={16} className="animate-spin"/> : <Mic size={16} />}
+          {isProcessing || isOptimizing ? <Loader2 size={16} className="animate-spin"/> : (isRecording ? <StopCircle size={16} /> : <Mic size={16} />)}
         </button>
       </div>
+      {isOptimizing && <div className="text-xs text-emerald-600 font-bold text-right flex items-center justify-end gap-1"><Wand2 size={10} /> 正在整理语句...</div>}
 
       {/* Hidden File Inputs */}
       <input 
@@ -569,7 +780,7 @@ export const EvidenceCreator = ({
       />
 
       <div className="flex gap-2">
-        <button onClick={handleAddText} disabled={!textInput.trim() || isProcessing || isCompressing} className="flex-1 bg-slate-800 text-white py-2 rounded-lg text-sm font-bold">
+        <button onClick={handleAddText} disabled={!textInput.trim() || isProcessing || isCompressing || isOptimizing} className="flex-1 bg-slate-800 text-white py-2 rounded-lg text-sm font-bold">
            添加文字
         </button>
         
