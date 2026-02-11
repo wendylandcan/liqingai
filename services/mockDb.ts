@@ -167,6 +167,61 @@ export const MockDb = {
     }
   },
 
+  // Sync a specific case from Cloud to Local (Fix for Plaintiff waiting screen)
+  syncCaseFromCloud: async (caseId: string): Promise<CaseData | null> => {
+    const db = getDb();
+    
+    try {
+      const { data: remoteCase, error } = await supabase
+        .from('cases')
+        .select('*')
+        .eq('id', caseId)
+        .single();
+
+      if (error || !remoteCase) {
+        // If fetch fails, return local version if exists, or null
+        return db[caseId] || null;
+      }
+
+      // Map snake_case to camelCase
+      const localCase: CaseData = {
+        id: remoteCase.id,
+        shareCode: remoteCase.share_code,
+        createdDate: new Date(remoteCase.created_at).getTime(),
+        lastUpdateDate: Date.now(), // Force update timestamp
+        plaintiffId: remoteCase.plaintiff_id,
+        defendantId: remoteCase.defendant_id,
+        category: remoteCase.category,
+        description: remoteCase.description || '',
+        title: remoteCase.title,
+        plaintiffSummary: remoteCase.plaintiff_summary,
+        demands: remoteCase.demands || '',
+        evidence: remoteCase.evidence || [],
+        defenseStatement: remoteCase.defense_statement || '',
+        defenseSummary: remoteCase.defense_summary,
+        defendantEvidence: remoteCase.defendant_evidence || [],
+        plaintiffRebuttal: remoteCase.plaintiff_rebuttal || '',
+        plaintiffRebuttalEvidence: remoteCase.plaintiff_rebuttal_evidence || [], 
+        defendantRebuttal: remoteCase.defendant_rebuttal || '',
+        defendantRebuttalEvidence: remoteCase.defendant_rebuttal_evidence || [],
+        disputePoints: remoteCase.dispute_points || [],
+        judgePersona: remoteCase.judge_persona || JudgePersona.BORDER_COLLIE,
+        status: remoteCase.status as CaseStatus,
+        verdict: remoteCase.verdict
+      };
+
+      // Update Local Cache
+      db[localCase.id] = localCase;
+      saveDb(db);
+
+      return localCase;
+
+    } catch (e) {
+      console.warn("Sync failed, returning local data:", e);
+      return db[caseId] || null;
+    }
+  },
+
   // Update a case
   updateCase: async (id: string, updates: Partial<CaseData>): Promise<CaseData> => {
     const db = getDb();

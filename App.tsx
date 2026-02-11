@@ -692,13 +692,19 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showDefaultJudgmentConfirm, setShowDefaultJudgmentConfirm] = useState(false);
 
-  const load = () => {
-    const c = MockDb.getCase(caseId);
-    setData(c);
+  const load = async () => {
+    // Sync from cloud instead of just local get to ensure multi-user updates are reflected
+    const c = await MockDb.syncCaseFromCloud(caseId);
+    if (c) setData(c);
     setLoading(false);
   };
 
-  useEffect(() => { load(); const int = setInterval(load, 2000); return () => clearInterval(int); }, [caseId]);
+  // Poll every 3 seconds to keep UI in sync
+  useEffect(() => { 
+      load(); 
+      const int = setInterval(load, 3000); 
+      return () => clearInterval(int); 
+  }, [caseId]);
 
   const update = async (patch: Partial<CaseData>) => {
     if (!data) return;
