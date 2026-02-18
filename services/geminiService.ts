@@ -3,8 +3,15 @@ import { GoogleGenAI } from "@google/genai";
 import { JudgePersona, Verdict, EvidenceItem, SentimentResult, FactCheckResult, DisputePoint, EvidenceType } from "../types";
 
 // --- Initialize Client ---
-// Use process.env.API_KEY directly as per guidelines
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- Initialize Client ---
+// ✅ 修正：使用 import.meta.env.VITE_... 读取变量
+const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+
+if (!apiKey) {
+  throw new Error("❌ 缺少 API Key！请检查 Zeabur 环境变量是否为 VITE_GOOGLE_API_KEY");
+}
+
+const ai = new GoogleGenAI({ apiKey: apiKey });
 
 // --- Model Constants ---
 // Upgraded to Gemini 3 series as per latest guidelines and to potentially alleviate 2.0 flash quota issues
