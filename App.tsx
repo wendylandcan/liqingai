@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Gavel, 
@@ -23,14 +24,17 @@ import {
   Swords, 
   MessageSquare, 
   UserX,
-  GraduationCap
+  GraduationCap,
+  Gamepad2,
+  Gift
 } from 'lucide-react';
 import { 
   CaseData, 
   CaseStatus, 
   UserRole, 
   Verdict, 
-  JudgePersona 
+  JudgePersona,
+  PenaltyTask
 } from './types';
 import * as GeminiService from './services/geminiService';
 import { MockDb } from './services/mockDb';
@@ -279,8 +283,19 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
 
   const handleJudgement = async () => {
     setIsDeliberating(true);
-    // Start progress animation
-    setTimeout(() => setProgress(100), 100);
+    setProgress(0);
+    
+    // Simulate progress: Reaches 95% in about 48s (0.4% per 200ms)
+    // This provides a "live" feel compared to pure CSS transition
+    const timer = setInterval(() => {
+      setProgress(old => {
+        if (old >= 95) {
+            // Stall at 99% max until done
+            return old < 99 ? old + 0.05 : 99;
+        }
+        return old + 0.4; 
+      });
+    }, 200);
 
     try {
       const verdict = await GeminiService.generateVerdict(
@@ -291,21 +306,33 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
         data.disputePoints || [],
         persona
       );
-      onSubmit({ verdict, judgePersona: persona, status: CaseStatus.CLOSED });
-    } catch (e) { alert("AI 法官忙碌中"); setIsDeliberating(false); setProgress(0); } 
+      
+      clearInterval(timer);
+      setProgress(100);
+
+      // Brief delay to show 100% before switching view
+      setTimeout(() => {
+          onSubmit({ verdict, judgePersona: persona, status: CaseStatus.CLOSED });
+      }, 500);
+    } catch (e) { 
+        clearInterval(timer);
+        alert("AI 法官忙碌中: " + (e as any).message); 
+        setIsDeliberating(false); 
+        setProgress(0); 
+    } 
   };
 
   const personas = [
     { 
       id: JudgePersona.BORDER_COLLIE, 
       name: "汪汪法官", 
-      desc: "重视逻辑，绝对中立，擅长理性分析",
+      desc: "客观中立，理性判断，法理思维断案",
       icon: <Dog size={32} className="text-slate-800" />
     },
     { 
       id: JudgePersona.CAT, 
       name: "喵喵法官", 
-      desc: "重视情理，擅长抚慰情绪，调解矛盾",
+      desc: "兼顾事实与情绪，治愈系中立判决",
       icon: <Cat size={32} className="text-rose-600" />
     }
   ];
@@ -317,8 +344,7 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
           {/* Animated Scene: Reading */}
           <div className="relative flex flex-col items-center justify-center mt-12 mb-12">
              {/* The Judge (Head moving slightly left to right to simulate reading) */}
-             {/* Added Graduation Cap floating on head */}
-             <div className="relative z-10 transition-transform duration-1000 ease-in-out" style={{ animation: 'readingHead 2s ease-in-out infinite alternate' }}>
+             <div className="relative z-10 transition-transform animate-reading-head">
                 <div className="absolute -top-12 left-1/2 -translate-x-1/2 z-20 transform -rotate-6">
                     <GraduationCap size={64} className="text-slate-900 fill-slate-800 drop-shadow-md" strokeWidth={1.5} />
                 </div>
@@ -328,14 +354,6 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
                    <Dog size={110} className="text-slate-800 drop-shadow-xl" strokeWidth={1.8} />
                 )}
              </div>
-             
-             {/* Dynamic styles for keyframes since we can't easily add global css here without style tag */}
-             <style>{`
-               @keyframes readingHead {
-                 0% { transform: translateX(-5px) rotate(-2deg); }
-                 100% { transform: translateX(5px) rotate(2deg); }
-               }
-             `}</style>
           </div>
 
           <div className="text-center space-y-3 max-w-xs mx-auto">
@@ -347,19 +365,22 @@ const AdjudicationStep = ({ data, onSubmit }: { data: CaseData, onSubmit: (d: Pa
              </p>
           </div>
 
-          {/* Progress Bar (60s duration) */}
-          <div className="w-full max-w-xs bg-slate-100 h-3 rounded-full overflow-hidden shadow-inner border border-slate-200">
-             <div 
-               className="h-full rounded-full transition-all ease-linear"
-               style={{ 
-                 width: `${progress}%`, 
-                 backgroundColor: isCat ? '#fb7185' : '#475569', 
-                 transitionDuration: '60000ms' // 60 seconds
-               }}
-             ></div>
+          {/* Progress Bar with Percentage Text */}
+          <div className="w-full max-w-xs">
+            <div className="bg-slate-100 h-3 rounded-full overflow-hidden shadow-inner border border-slate-200 mb-2">
+               <div 
+                 className="h-full rounded-full transition-all ease-linear duration-200"
+                 style={{ 
+                   width: `${progress}%`, 
+                   backgroundColor: isCat ? '#fb7185' : '#475569'
+                 }}
+               ></div>
+            </div>
+            <div className="flex justify-between px-1">
+                <p className="text-xs text-slate-400 italic">正在查阅案卷与证据...</p>
+                <p className={`text-xs font-bold ${isCat ? 'text-rose-500' : 'text-slate-500'}`}>{Math.floor(progress)}%</p>
+            </div>
           </div>
-          
-          <p className="text-xs text-slate-400 italic">正在查阅案卷与证据...</p>
        </div>
     )
   }
@@ -413,6 +434,10 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
   // Styles based on persona
   const headerClass = isCat ? 'bg-rose-400' : 'bg-slate-800';
   
+  // Filter Tasks
+  const plaintiffTasks = verdict.penaltyTasks.filter(t => t.assignee === 'PLAINTIFF');
+  const defendantTasks = verdict.penaltyTasks.filter(t => t.assignee === 'DEFENDANT');
+
   // Helper to format the final judgment text
   const renderJudgmentText = (text: string) => {
     // 1. Normalize line breaks
@@ -428,8 +453,30 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
     return normalized.split('\n').map((line, index) => {
       const trimmed = line.trim();
       if (!trimmed) return null;
+
+      // Check for the specific pattern: "1. 【Decision】Content"
+      // Example: "1. 【支持】 关于要求..."
+      const match = trimmed.match(/^(\d+[.、])?\s*(【.*?】)(.*)/);
+      
+      if (match) {
+         const [_, prefix, decision, content] = match;
+         let decisionColor = 'text-slate-700';
+         // Check decision type for coloring
+         if (decision.includes('支持') && !decision.includes('修正')) decisionColor = 'text-green-600'; // Pure support
+         else if (decision.includes('驳回')) decisionColor = 'text-rose-600'; // Reject
+         else if (decision.includes('修正') || decision.includes('建议')) decisionColor = 'text-orange-600'; // Modify
+
+         return (
+            <p key={index} className="mb-3 pl-0 text-slate-700 font-sans leading-relaxed">
+               {prefix && <span className="font-bold mr-1 text-slate-800">{prefix}</span>}
+               <span className={`font-bold ${decisionColor} mr-1`}>{decision}</span>
+               <span style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>{content}</span>
+            </p>
+         );
+      }
+
       return (
-        <p key={index} className={`mb-2 ${/^\d+[.、]/.test(trimmed) ? 'pl-0' : ''}`}>
+        <p key={index} className={`mb-2 ${/^\d+[.、]/.test(trimmed) ? 'pl-0' : ''}`} style={{ fontFamily: '"Noto Sans SC", sans-serif' }}>
           {trimmed}
         </p>
       );
@@ -466,8 +513,8 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
             <span className="text-indigo-500 flex items-center gap-1">被告 {verdict.responsibilitySplit.defendant}% <User size={18}/></span>
          </div>
          <div className="h-6 bg-slate-100 rounded-full overflow-hidden flex shadow-inner">
-            <div className="bg-rose-500 h-full flex items-center justify-center" style={{ width: `${verdict.responsibilitySplit.plaintiff}%` }}></div>
-            <div className="bg-indigo-500 h-full flex items-center justify-center" style={{ width: `${verdict.responsibilitySplit.defendant}%` }}></div>
+            <div className="bg-rose-500 h-full flex items-center justify-center transition-all duration-1000" style={{ width: `${verdict.responsibilitySplit.plaintiff}%` }}></div>
+            <div className="bg-indigo-500 h-full flex items-center justify-center transition-all duration-1000" style={{ width: `${verdict.responsibilitySplit.defendant}%` }}></div>
          </div>
       </div>
 
@@ -515,26 +562,64 @@ const VerdictView = ({ verdict, persona, onReset, onAppeal }: { verdict: Verdict
         </div>
       </div>
       
-      {verdict.penaltyTasks && verdict.penaltyTasks.length > 0 && (
+      {/* Revised Penalty Tasks Section - "Love Ice-breaking Adventure" */}
+      {(plaintiffTasks.length > 0 || defendantTasks.length > 0) && (
          <div className="bg-white p-6 rounded-2xl shadow-sm border-2 border-slate-100">
-             <h3 className="text-xl text-slate-800 mb-3 flex items-center gap-2">
-                 补偿任务
-             </h3>
-             <ul className="list-disc list-inside text-slate-600 space-y-1 font-sans">
-               {verdict.penaltyTasks.map((t: any, i) => {
-                 // Check if it's an object to prevent React Error #31
-                 const text = typeof t === 'object' && t !== null 
-                    ? (t.taskName && t.description ? `${t.taskName}: ${t.description}` : JSON.stringify(t)) 
-                    : String(t);
-                 return <li key={i}>{text}</li>;
-               })}
-             </ul>
+             <div className="flex items-center gap-2 mb-2">
+                <Gamepad2 className="text-purple-500" size={24}/>
+                <h3 className="text-xl text-slate-800 font-bold">
+                    爱的破冰大冒险
+                </h3>
+             </div>
+             <p className="text-xs text-slate-400 mb-4 ml-1">完成这些互动小挑战，让爱重新流动起来~</p>
+             
+             <div className="space-y-6">
+                 {/* Plaintiff Tasks */}
+                 {plaintiffTasks.length > 0 && (
+                     <div className="bg-rose-50 rounded-xl p-4 border border-rose-100 relative overflow-hidden">
+                         <div className="absolute -right-2 -bottom-2 text-rose-100 opacity-50 transform rotate-12">
+                             <Heart size={60} />
+                         </div>
+                         <h4 className="font-bold text-rose-800 mb-3 flex items-center gap-2">
+                             <User size={16} /> 原告请执行：
+                         </h4>
+                         <ul className="space-y-2">
+                           {plaintiffTasks.map((t, i) => (
+                             <li key={i} className="bg-white/80 p-3 rounded-lg text-slate-700 shadow-sm text-sm font-sans flex items-start gap-2 border border-rose-100/50">
+                                <span className="text-rose-400 mt-0.5"><Gift size={14}/></span>
+                                {t.content}
+                             </li>
+                           ))}
+                         </ul>
+                     </div>
+                 )}
+
+                 {/* Defendant Tasks */}
+                 {defendantTasks.length > 0 && (
+                     <div className="bg-indigo-50 rounded-xl p-4 border border-indigo-100 relative overflow-hidden">
+                         <div className="absolute -right-2 -bottom-2 text-indigo-100 opacity-50 transform rotate-12">
+                             <Gamepad2 size={60} />
+                         </div>
+                         <h4 className="font-bold text-indigo-800 mb-3 flex items-center gap-2">
+                             <User size={16} /> 被告请执行：
+                         </h4>
+                         <ul className="space-y-2">
+                           {defendantTasks.map((t, i) => (
+                             <li key={i} className="bg-white/80 p-3 rounded-lg text-slate-700 shadow-sm text-sm font-sans flex items-start gap-2 border border-indigo-100/50">
+                                <span className="text-indigo-400 mt-0.5"><Gift size={14}/></span>
+                                {t.content}
+                             </li>
+                           ))}
+                         </ul>
+                     </div>
+                 )}
+             </div>
          </div>
       )}
 
       <div className="space-y-3 pt-2 font-sans">
         <button onClick={onReset} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">结案，新案件</button>
-        <button onClick={onAppeal} className="w-full bg-white text-rose-600 border-2 border-rose-100 font-bold py-3 rounded-xl">不服判决？补充</button>
+        <button onClick={onAppeal} className="w-full bg-white text-rose-600 border-2 border-rose-100 font-bold py-3 rounded-xl">不服判决？换法官重审</button>
       </div>
     </div>
   )
@@ -807,7 +892,11 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
         }
 
         // 2. Otherwise, go back to Debate
-        update({ status: CaseStatus.DEBATE });
+        // Explicitly resend disputePoints to ensure they are sync'd and not overwritten by stale data
+        update({ 
+            status: CaseStatus.DEBATE,
+            disputePoints: data.disputePoints 
+        });
         return;
     }
 
@@ -904,19 +993,12 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
         persona={data.judgePersona} 
         onReset={() => onBack()} 
         onAppeal={() => {
-            // Logic to determine where to go back to "Unclose" the case for supplementation
-            const isDefaultJudgment = data.defenseStatement === "（被告缺席，放弃答辩）";
-            if (isDefaultJudgment) {
-                 // Reset default judgment state so users can edit or wait for defendant
-                 update({ 
-                     status: CaseStatus.DEFENSE_PENDING,
-                     defenseStatement: "", 
-                     defenseSummary: undefined 
-                 });
-            } else {
-                 // Normal flow: Go back to Debate to allow adding more arguments
-                 update({ status: CaseStatus.DEBATE });
-            }
+            // Updated behavior: Return to Debate phase to allow editing/preserving records
+            // Explicitly push disputePoints to ensure they are saved on the server for the new status
+            update({ 
+                status: CaseStatus.ADJUDICATING,
+                disputePoints: data.disputePoints
+            });
         }} 
       />;
       break;
@@ -975,62 +1057,81 @@ const CaseManager = ({ caseId, user, onBack, onSwitchUser }: { caseId: string, u
 
 const App = () => {
   const [session, setSession] = useState<any>(null);
-  const [user, setUser] = useState<string | null>(null);
-  const [activeCaseId, setActiveCaseId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [currentCaseId, setCurrentCaseId] = useState<string | null>(null);
+  const [offlineUser, setOfflineUser] = useState<string | null>(null);
+
+  // Load offline user on mount
+  useEffect(() => {
+    const cached = localStorage.getItem('court_of_love_offline_user');
+    if (cached) setOfflineUser(cached);
+  }, []);
 
   useEffect(() => {
-    // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session?.user) {
-        // Use metadata username or fallback to email
-        const u = session.user.user_metadata?.username || session.user.email;
-        setUser(u);
-      }
-      setLoading(false);
-    });
+    // Wrap getSession in a catch to prevent crash if Supabase URL is invalid
+    supabase.auth.getSession()
+      .then(({ data: { session } }) => {
+         setSession(session);
+      })
+      .catch(err => {
+         console.warn("Supabase auth failed (likely offline/demo mode):", err);
+         // Do not set session if fetch fails, let App fall back to Auth or offlineUser
+      });
 
-    // Listen for changes
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session?.user) {
-        const u = session.user.user_metadata?.username || session.user.email;
-        setUser(u);
-      } else {
-        setUser(null);
+      // Reset case view on logout
+      if (!session) {
+          setCurrentCaseId(null);
+          // If we logged out via Supabase, also clear local offline user if any
+          // (Unless we want to persist offline user separately? Let's assume explicit logout clears all)
       }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  if (loading) {
-    return <div className="min-h-screen flex items-center justify-center bg-rose-50"><Loader2 className="animate-spin text-rose-600" size={32}/></div>;
+  const handleLogout = async () => {
+    try {
+        await supabase.auth.signOut();
+    } catch(e) {
+        console.warn("Sign out failed", e);
+    }
+    localStorage.removeItem('court_of_love_offline_user');
+    setOfflineUser(null);
+    setSession(null);
+    setCurrentCaseId(null);
+  };
+
+  const handleOfflineLogin = (username: string) => {
+      localStorage.setItem('court_of_love_offline_user', username);
+      setOfflineUser(username);
+  };
+
+  // Determine user identifier (Supabase or Offline)
+  const activeUser = session?.user?.user_metadata?.username || session?.user?.email || offlineUser;
+
+  if (!activeUser) {
+    return <Auth onLoginFallback={handleOfflineLogin} />;
   }
 
-  if (!session || !user) {
-    return <Auth />;
-  }
-
-  if (activeCaseId) {
+  if (currentCaseId) {
     return (
-      <CaseManager 
-        caseId={activeCaseId} 
-        user={user} 
-        onBack={() => setActiveCaseId(null)}
-        onSwitchUser={() => supabase.auth.signOut()}
+      <CaseManager
+        caseId={currentCaseId}
+        user={activeUser}
+        onBack={() => setCurrentCaseId(null)}
+        onSwitchUser={handleLogout}
       />
     );
   }
 
   return (
-    <Dashboard 
-      user={user} 
-      onSelectCase={setActiveCaseId} 
-      onLogout={() => supabase.auth.signOut()} 
+    <Dashboard
+      user={activeUser}
+      onSelectCase={setCurrentCaseId}
+      onLogout={handleLogout}
     />
   );
 };

@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -23,6 +24,15 @@
       /* Utility class for the cute font */
       .font-cute {
         font-family: 'ZCOOL KuaiLe', cursive;
+      }
+
+      /* Animation for Judge Reading Head */
+      @keyframes readingHead {
+        0% { transform: translateX(-5px) rotate(-2deg); }
+        100% { transform: translateX(5px) rotate(2deg); }
+      }
+      .animate-reading-head {
+        animation: readingHead 2s ease-in-out infinite alternate;
       }
     </style>
   <script type="importmap">

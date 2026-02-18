@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+
+import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from '../supabaseClient';
 import { 
   Heart, 
@@ -7,16 +8,23 @@ import {
   Mail, 
   Lock, 
   Loader2, 
-  ArrowRight 
+  ArrowRight,
+  WifiOff
 } from 'lucide-react';
 
-const Auth = () => {
+const Auth = ({ onLoginFallback }: { onLoginFallback?: (username: string) => void }) => {
   const [isRegister, setIsRegister] = useState(false);
   const [loginId, setLoginId] = useState("");
   const [password, setPassword] = useState("");
   const [username, setUsername] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ text: string, type: 'error' | 'success' } | null>(null);
+  
+  // Track mounted state to prevent state updates after unmount
+  const isMounted = useRef(true);
+  useEffect(() => {
+    return () => { isMounted.current = false; };
+  }, []);
 
   // Helper to save mapping locally for reliability in demos
   const saveUserMapping = (user: string, email: string) => {
@@ -49,11 +57,6 @@ const Auth = () => {
         if (!trimmedUsername) throw new Error("请输入用户名");
         if (!trimmedLoginId.includes('@')) throw new Error("注册需要有效的邮箱地址");
         
-        // Check if username is taken (optional optimization, depends on RLS)
-        // We rely on the unique constraint in the DB, which will throw an error on signUp if using a trigger,
-        // or we can try to query profiles if RLS allows public read of usernames.
-        // For this implementation, we focus on the Email Duplicate Check as requested.
-
         const { data, error } = await supabase.auth.signUp({
           email: trimmedLoginId,
           password: password,
@@ -83,12 +86,15 @@ const Auth = () => {
             // 2. Attempt to write to Profiles table (Fix for cross-device/cleared cache)
             // This ensures the "select" query in the Login block works.
             try {
-                await supabase.from('profiles').upsert({
+                const { error: upsertError } = await supabase.from('profiles').upsert({
                     id: data.user.id,
                     username: trimmedUsername,
                     email: trimmedLoginId,
                     updated_at: new Date().toISOString()
                 });
+                if (upsertError) {
+                     console.warn("Profile creation warning:", upsertError.message);
+                }
             } catch (dbErr) {
                 console.warn("Profile creation failed (Database might be missing 'profiles' table), falling back to local mapping.", dbErr);
             }
@@ -96,24 +102,18 @@ const Auth = () => {
             // 3. Attempt Auto-Login (Bypass Email Verification Requirement if Backend Configured)
             if (!data.session) {
                 // If no session returned, try to sign in immediately.
-                // If backend requires verification, this will throw "Email not confirmed".
-                // If backend allows login without verification (but didn't send session on signup for some reason), this works.
                 const { error: signInError } = await supabase.auth.signInWithPassword({
                     email: trimmedLoginId,
                     password
                 });
                 
                 if (signInError) {
-                   // If this is specifically "Email not confirmed", we have to tell the user.
-                   // But since the request is "No verification needed", we assume the user will fix the backend config.
-                   // We throw here so the error handler catches it.
                    throw signInError;
                 }
             }
         }
 
-        // If we reach here, we are logged in (either via signUp session or auto-login).
-        // No need to show success message, App will redirect.
+        // If we reach here, we are logged in. App will unmount Auth.
         
       } else {
         // Login Logic
@@ -127,7 +127,6 @@ const Auth = () => {
             
             if (!foundEmail) {
                  // 2. Fallback to Supabase Lookup if not found locally
-                 // This requires a 'profiles' table with 'username' and 'email' columns.
                  try {
                      const { data, error } = await supabase
                         .from('profiles')
@@ -148,7 +147,9 @@ const Auth = () => {
             if (foundEmail) {
                 signInEmail = foundEmail;
             } else {
-                throw new Error("用户名不存在或未配置 (请尝试使用邮箱登录)");
+                // throw new Error("用户名不存在或未配置 (请尝试使用邮箱登录)");
+                // Allow "Offline Login" if we can't find email and later fetch fails
+                signInEmail = trimmedLoginId; 
             }
         }
 
@@ -159,6 +160,8 @@ const Auth = () => {
         if (error) throw error;
       }
     } catch (err: any) {
+      if (!isMounted.current) return;
+
       let errorMsg = err.message || "操作失败，请重试";
       const lowerMsg = errorMsg.toLowerCase();
       
@@ -166,10 +169,8 @@ const Auth = () => {
       if (lowerMsg.includes("invalid login credentials")) {
         errorMsg = "账号或密码错误";
       } else if (lowerMsg.includes("email not confirmed")) {
-        // Updated to be more specific about the backend requirement
         errorMsg = "登录失败：系统开启了邮箱验证 (请检查邮箱或联系管理员关闭验证)";
       } else if (lowerMsg.includes("user already registered") || lowerMsg.includes("该邮箱已被注册")) {
-        // Includes the manual throw above
         errorMsg = "该邮箱已被注册！";
       } else if (lowerMsg.includes("unique constraint")) {
         errorMsg = "用户名或邮箱已被使用";
@@ -179,11 +180,25 @@ const Auth = () => {
         errorMsg = "操作过于频繁，请稍后再试";
       } else if (lowerMsg.includes("error sending confirmation mail")) {
         errorMsg = "发送验证邮件失败，请检查邮箱地址";
+      } else if (lowerMsg.includes("failed to fetch")) {
+        // Handle Offline / Bad Config
+        if (onLoginFallback) {
+             const fallbackUser = username || loginId.split('@')[0] || "User";
+             setMessage({ text: "无法连接服务器，已为您开启离线模式...", type: 'success' });
+             setTimeout(() => {
+                 onLoginFallback(fallbackUser);
+             }, 1000);
+             return;
+        } else {
+             errorMsg = "无法连接服务器，且离线模式未启用。";
+        }
       }
 
       setMessage({ text: errorMsg, type: 'error' });
     } finally {
-      setLoading(false);
+      if (isMounted.current) {
+        setLoading(false);
+      }
     }
   };
 

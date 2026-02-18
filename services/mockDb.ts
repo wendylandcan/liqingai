@@ -1,3 +1,4 @@
+
 import { CaseData, CaseStatus, JudgePersona } from "../types";
 import { supabase } from '../supabaseClient';
 
@@ -151,6 +152,8 @@ export const MockDb = {
         defendantRebuttal: remoteCase.defendant_rebuttal || '',
         defendantRebuttalEvidence: remoteCase.defendant_rebuttal_evidence || [],
         disputePoints: remoteCase.dispute_points || [],
+        // FIX: Map last_analyzed_hash
+        lastAnalyzedHash: remoteCase.last_analyzed_hash, 
         judgePersona: remoteCase.judge_persona || JudgePersona.BORDER_COLLIE,
         status: remoteCase.status as CaseStatus,
         verdict: remoteCase.verdict
@@ -169,7 +172,8 @@ export const MockDb = {
 
   // Sync a specific case from Cloud to Local (Fix for Plaintiff waiting screen)
   syncCaseFromCloud: async (caseId: string): Promise<CaseData | null> => {
-    const db = getDb();
+    // NOTE: We do NOT read db here initially. We read it after the async call 
+    // to ensure we capture any local updates that happened while waiting for the network.
     
     try {
       const { data: remoteCase, error } = await supabase
@@ -178,17 +182,17 @@ export const MockDb = {
         .eq('id', caseId)
         .single();
 
+      // Read fresh local DB *after* the async gap to avoid race condition overwrites
+      const freshDb = getDb();
+      const local = freshDb[caseId];
+
       if (error || !remoteCase) {
         // If fetch fails, return local version if exists, or null
-        return db[caseId] || null;
+        return local || null;
       }
 
       // --- CONFLICT RESOLUTION LOGIC ---
       // Check if the local status is "ahead" of the remote status. 
-      // This happens when we just updated the status locally (e.g., to DEBATE) 
-      // but the remote DB (or read replica) is slightly behind or this poll request 
-      // was initiated before the update completed.
-      const local = db[caseId];
       if (local && local.status) {
           const statusOrder = {
             [CaseStatus.DRAFTING]: 0,
@@ -206,17 +210,37 @@ export const MockDb = {
           const localLevel = statusOrder[localS] || 0;
           const remoteLevel = statusOrder[remoteS] || 0;
 
-          // Specific fix 1: Local is DEBATE (4) or ADJUDICATING (5), Remote is CROSS_EXAMINATION (3)
-          if (localLevel > remoteLevel && remoteS === CaseStatus.CROSS_EXAMINATION) {
-              console.log(`[Sync] Ignoring stale remote data (Lagging). Local: ${localS} > Remote: ${remoteS}`);
+          // Stability Logic: Prevent regression for critical states
+          
+          // 1. Default Judgment Protection:
+          if (localS === CaseStatus.ADJUDICATING && remoteLevel < 5) {
+             console.log(`[Sync] Ignoring stale remote data (Lagging Default Judgment). Local: ADJUDICATING > Remote: ${remoteS}`);
+             return local;
+          }
+
+          // 2. Verdict Protection:
+          if (localS === CaseStatus.CLOSED && remoteLevel < 6) {
+              console.log(`[Sync] Ignoring stale remote data (Lagging Verdict). Local: CLOSED > Remote: ${remoteS}`);
               return local;
           }
 
-          // Specific fix 2: Local is CLOSED (6), Remote is ADJUDICATING (5)
-          // This prevents the "Flashback to Judge Selection" bug
-          if (localS === CaseStatus.CLOSED && remoteS === CaseStatus.ADJUDICATING) {
-              console.log(`[Sync] Ignoring stale remote data (Lagging Verdict). Local: CLOSED > Remote: ADJUDICATING`);
+          // 3. General Forward Progress (Debate Phase):
+          if (localS === CaseStatus.DEBATE && remoteLevel < 4) {
+              console.log(`[Sync] Ignoring stale remote data (Lagging Debate). Local: DEBATE > Remote: ${remoteS}`);
               return local;
+          }
+
+          // 4. Appeal Protection (Appeal from Closed -> Adjudicating/Debate)
+          // If we locally moved BACKWARDS (e.g., from Closed to Debate), and remote is still Closed (ahead),
+          // we should trust Local (user intent) over Remote (stale state).
+          if ((localS === CaseStatus.ADJUDICATING || localS === CaseStatus.DEBATE) && remoteLevel === 6) {
+               console.log(`[Sync] Ignoring remote data (Appeal/Back Action). Local: ${localS} < Remote: CLOSED`);
+               return local;
+          }
+          
+          if (localS === CaseStatus.DEBATE && remoteLevel === 5) {
+               console.log(`[Sync] Ignoring remote data (Back from Judge Select). Local: DEBATE < Remote: ADJUDICATING`);
+               return local;
           }
       }
       // ---------------------------------
@@ -242,21 +266,27 @@ export const MockDb = {
         plaintiffRebuttalEvidence: remoteCase.plaintiff_rebuttal_evidence || [], 
         defendantRebuttal: remoteCase.defendant_rebuttal || '',
         defendantRebuttalEvidence: remoteCase.defendant_rebuttal_evidence || [],
-        disputePoints: remoteCase.dispute_points || [],
+        
+        // FIX: Map dispute_points with fallback to local to prevent data loss if column missing/sync fail
+        disputePoints: remoteCase.dispute_points || (local && local.disputePoints) || [],
+        
+        // FIX: Map last_analyzed_hash with fallback to local to ensure 'Skip Analysis' logic works
+        lastAnalyzedHash: remoteCase.last_analyzed_hash || (local && local.lastAnalyzedHash), 
+
         judgePersona: remoteCase.judge_persona || JudgePersona.BORDER_COLLIE,
         status: remoteCase.status as CaseStatus,
         verdict: remoteCase.verdict
       };
 
       // Update Local Cache
-      db[localCase.id] = localCase;
-      saveDb(db);
+      freshDb[localCase.id] = localCase;
+      saveDb(freshDb);
 
       return localCase;
 
     } catch (e) {
       console.warn("Sync failed, returning local data:", e);
-      return db[caseId] || null;
+      return getDb()[caseId] || null;
     }
   },
 
@@ -289,6 +319,9 @@ export const MockDb = {
         if (updates.evidence !== undefined) payload.evidence = updates.evidence;
         if (updates.defendantEvidence !== undefined) payload.defendant_evidence = updates.defendantEvidence;
         if (updates.disputePoints !== undefined) payload.dispute_points = updates.disputePoints;
+        // FIX: Map lastAnalyzedHash for persistence
+        if (updates.lastAnalyzedHash !== undefined) payload.last_analyzed_hash = updates.lastAnalyzedHash;
+
         if (updates.verdict !== undefined) payload.verdict = updates.verdict;
         if (updates.judgePersona !== undefined) payload.judge_persona = updates.judgePersona;
         if (updates.defendantId !== undefined) payload.defendant_id = updates.defendantId;

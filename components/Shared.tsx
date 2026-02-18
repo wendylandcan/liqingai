@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Loader2, 
@@ -503,7 +504,11 @@ export const EvidenceList = ({
                   {isContested && <ShieldAlert size={20} className="text-red-500" />}
               </div>
             </div>
-            {isContested && <p className="text-xs text-red-600 mt-2 font-bold ml-10">已提出异议 (Contested)</p>}
+            {isContested && (
+              <div className="flex items-center justify-between mt-2 ml-10">
+                 <p className="text-xs text-red-600 font-bold">已提出异议 (Contested)</p>
+              </div>
+            )}
             {canContest && !isContested && <p className="text-xs text-slate-400 mt-2 ml-10">点击提出异议</p>}
           </div>
         );

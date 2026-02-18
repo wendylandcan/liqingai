@@ -34,6 +34,7 @@ export interface EvidenceItem {
   description?: string;
   isContested: boolean; // Has the opposing party objected?
   submittedBy: UserRole;
+  aiAnalysis?: string; // New: AI analysis of credibility and relevance based on cross-examination
 }
 
 export interface DisputePoint {
@@ -47,6 +48,11 @@ export interface DisputePoint {
 export interface DisputeAnalysis {
   title: string;
   analysis: string;
+}
+
+export interface PenaltyTask {
+  assignee: 'PLAINTIFF' | 'DEFENDANT';
+  content: string;
 }
 
 export interface CaseData {
@@ -80,6 +86,9 @@ export interface CaseData {
 
   // Debate Phase
   disputePoints: DisputePoint[];
+  
+  // State Tracking
+  lastAnalyzedHash?: string; // Fingerprint of content when disputePoints were last generated
 
   judgePersona: JudgePersona;
   status: CaseStatus;
@@ -95,7 +104,7 @@ export interface Verdict {
   };
   reasoning: string;
   finalJudgment: string;
-  penaltyTasks: string[];
+  penaltyTasks: PenaltyTask[];
   tone: string;
   disputeAnalyses?: DisputeAnalysis[]; // New: Analysis for each dispute point
 }

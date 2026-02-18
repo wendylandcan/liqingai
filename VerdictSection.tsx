@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { 
   Scale, 
@@ -33,7 +34,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState("");
-  
+
   // Handlers for "Save Draft / Update State"
   const handleUpdate = (patch: Partial<CaseData>) => {
     onSubmit(patch); 
@@ -54,10 +55,40 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
     handleUpdate({ defendantEvidence: updated });
   };
 
+  // Helper: Generate a "fingerprint" of the current case content that affects the AI analysis
+  const computeContentHash = () => {
+    // We combine all fields that the AI reads to generate dispute points.
+    // If any of these change, the hash changes.
+    const relevantContent = {
+        desc: data.description,
+        defStmt: data.defenseStatement,
+        plReb: data.plaintiffRebuttal, // Note: Use data.* not local state to ensure sync
+        defReb: data.defendantRebuttal || "",
+        // For evidence, we track ID, description and contested status.
+        // We assume IDs are unique and description changes capture edits.
+        ev: data.evidence.map(e => `${e.id}-${e.description}-${e.isContested}`).join('|'),
+        defEv: data.defendantEvidence.map(e => `${e.id}-${e.description}-${e.isContested}`).join('|')
+    };
+    return JSON.stringify(relevantContent);
+  };
+
   const handleFinishCrossExam = async () => {
+    const currentHash = computeContentHash();
+    const hasDisputePoints = data.disputePoints && data.disputePoints.length > 0;
+    
+    // CONDITION CHECK:
+    // If we have existing points AND the content hasn't changed since the last analysis...
+    if (hasDisputePoints && data.lastAnalyzedHash === currentHash) {
+        // ... Skip AI analysis and go directly to Debate.
+        // This preserves the user's previous inputs in the Debate phase.
+        onSubmit({ status: CaseStatus.DEBATE });
+        return;
+    }
+
+    // Otherwise (New case OR Content modified), run AI analysis.
     setIsAnalyzing(true);
     setProgress(0);
-    setErrorMsg(""); // Clear previous errors
+    setErrorMsg(""); 
 
     const timer = setInterval(() => {
       setProgress(old => {
@@ -73,7 +104,7 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
             data.defenseStatement,
             data.plaintiffRebuttal,
             data.defendantRebuttal || "",
-            data.evidence // Passed Plaintiff Evidence as requested
+            data.evidence 
         );
         
         clearInterval(timer);
@@ -82,7 +113,8 @@ export const VerdictSection: React.FC<VerdictSectionProps> = ({ data, onSubmit, 
         setTimeout(() => {
             onSubmit({ 
                 status: CaseStatus.DEBATE,
-                disputePoints: points
+                disputePoints: points,
+                lastAnalyzedHash: currentHash // Save the new fingerprint
             });
         }, 800);
 
